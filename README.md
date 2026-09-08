@@ -121,6 +121,7 @@ Wizard создаёт отдельный `MISTRAL_KEYS_MASTER_KEY` для лок
 | `tg_bot.py` | Telegram-команды, превью, inline-кнопки |
 | `main.py` | Основной цикл агента |
 | `instance_lock.py` | Защита от одновременного запуска двух процессов |
+| `daily_audit.py` | Ежедневная проверка прогонов, откликов, LLM и качества писем |
 | `setup_wizard.py` | Интерактивный мастер настройки |
 
 ---
@@ -156,6 +157,23 @@ Wizard создаёт отдельный `MISTRAL_KEYS_MASTER_KEY` для лок
 python -m compileall .
 pytest -q
 ```
+
+### Ежедневный аудит
+
+Аудит читает SQLite-базу без изменений и формирует отчёт о поисковых прогонах, откликах, ошибках LLM, неопределённых отправках и сопроводительных письмах:
+
+```bash
+python daily_audit.py --env-file .env
+python daily_audit.py --env-file .env --send
+```
+
+`--send` отправляет один отчёт за день в настроенный Telegram. На macOS можно дополнительно проверить и при необходимости перезапустить конкретный `launchd`-сервис:
+
+```bash
+python daily_audit.py --env-file .env --launchd-label com.example.hh-ai-agent --repair-service --send
+```
+
+Запуск по расписанию настраивается отдельно через cron, `launchd` или другой системный планировщик.
 
 ---
 
