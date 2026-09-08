@@ -10,6 +10,10 @@ candidate:
   salary_expectation: ""
   work_format: []
   excluded_positions: []
+  # Case-insensitive fragments checked against the employer name.
+  excluded_companies: []
+  # Case-insensitive fragments checked against the vacancy description.
+  excluded_keywords: []
   additional_information: ""
 
 hh:
@@ -17,8 +21,13 @@ hh:
   search_queries: []
   areas: []
   experience_filters: []
+  # Restrict HH search to vacancies marked as remote work.
+  remote_only: false
 
 cover_letter:
   language: "ru"
   max_length: 1800
   style: "professional"
+  # When configured, the exact portfolio URL is required before every application.
+  required_portfolio_url: ""
+  closing: ""

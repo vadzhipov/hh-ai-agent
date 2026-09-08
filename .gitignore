@@ -4,6 +4,7 @@ state.json
 storage_state*.json
 *.db
 *.db-*
+*.lock
 backups/
 .browser-profile*/
 .browser-smoke-profile/
