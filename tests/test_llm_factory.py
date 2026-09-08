@@ -34,6 +34,7 @@ def configured(tmp_path: Path, **overrides: str):
                 "LLM_MODEL": "custom-model",
                 "OPENAI_COMPATIBLE_BASE_URL": "https://provider.example/v1",
                 "OPENAI_COMPATIBLE_API_KEY": "compatible-key",
+                "OPENAI_COMPATIBLE_REASONING_ENABLED": "false",
             },
             OpenAICompatibleProvider,
         ),
@@ -50,6 +51,8 @@ def test_factory_builds_exactly_one_selected_adapter(
 
     assert isinstance(provider.adapter, adapter_type)
     assert not hasattr(provider, "fallbacks")
+    if isinstance(provider.adapter, OpenAICompatibleProvider):
+        assert provider.adapter.reasoning_enabled is False
 
 
 def test_factory_builds_mistral_key_manager(tmp_path: Path) -> None:

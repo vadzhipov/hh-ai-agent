@@ -171,3 +171,14 @@ def test_llm_numeric_settings_are_parsed(tmp_path: Path) -> None:
     assert settings.llm.max_output_tokens == 900
     assert settings.llm.max_requests_per_day == 7
     assert settings.llm.openai_compatible_json_mode is False
+
+
+@pytest.mark.parametrize("raw, expected", [("", None), ("false", False), ("true", True)])
+def test_optional_reasoning_setting(tmp_path: Path, raw: str, expected: bool | None) -> None:
+    settings = load(tmp_path, OPENAI_COMPATIBLE_REASONING_ENABLED=raw)
+    assert settings.llm.openai_compatible_reasoning_enabled is expected
+
+
+def test_invalid_reasoning_setting_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="OPENAI_COMPATIBLE_REASONING_ENABLED"):
+        load(tmp_path, OPENAI_COMPATIBLE_REASONING_ENABLED="sometimes")

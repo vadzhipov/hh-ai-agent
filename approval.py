@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Protocol
 
 from config import Settings
+from cover_letter import has_required_portfolio
 from database import ClaimResult, Database
 
 
@@ -79,6 +80,11 @@ class ApprovalService:
         if not self.settings.enable_real_apply:
             logger.warning("application_blocked job_id=%s reason=real_apply_disabled", job_id)
             return ApprovalResult(False, "Real applications are disabled")
+        vacancy = self.database.get(job_id)
+        if vacancy is not None and not has_required_portfolio(
+            vacancy.cover_letter, self.settings.profile.cover_letter.required_portfolio_url
+        ):
+            return ApprovalResult(False, "В письме отсутствует обязательная ссылка на портфолио")
         permit = self.database.approve(
             job_id,
             telegram_user_id,
@@ -91,6 +97,42 @@ class ApprovalService:
             return ApprovalResult(False, "Approval is missing, expired, or already used")
         logger.info("approval_received job_id=%s", job_id)
         permission = ApplicationPermission(job_id, permit, telegram_user_id)
+        sent = await self.sender.submit_application(permission)
+        return ApprovalResult(sent, "Application sent" if sent else "Application failed")
+
+    async def auto_apply(self, job_id: str) -> ApprovalResult:
+        if not self.settings.auto_apply.enabled:
+            return ApprovalResult(False, "Automatic applications are disabled")
+        if self.settings.app_mode != "approval" or not self.settings.enable_real_apply:
+            logger.warning("auto_application_blocked job_id=%s reason=mode", job_id)
+            return ApprovalResult(False, "Real applications are disabled")
+        vacancy = self.database.get(job_id)
+        if vacancy is None or vacancy.status.value != "pending_approval":
+            logger.warning("auto_application_blocked job_id=%s reason=not_pending", job_id)
+            return ApprovalResult(False, "Vacancy is not pending")
+        if (
+            vacancy.confidence is None
+            or vacancy.confidence < self.settings.auto_apply.min_confidence
+        ):
+            logger.info("auto_application_blocked job_id=%s reason=confidence", job_id)
+            return ApprovalResult(False, "Vacancy confidence is below the auto-apply threshold")
+        if not has_required_portfolio(
+            vacancy.cover_letter, self.settings.profile.cover_letter.required_portfolio_url
+        ):
+            logger.warning("auto_application_blocked job_id=%s reason=portfolio", job_id)
+            return ApprovalResult(False, "В письме отсутствует обязательная ссылка на портфолио")
+        permit = self.database.approve(
+            job_id,
+            self.settings.tg_user_id,
+            self.settings.tg_user_id,
+            self.now_factory(),
+            self.settings.approval_ttl_minutes,
+        )
+        if permit is None:
+            logger.warning("auto_application_blocked job_id=%s reason=approval_invalid", job_id)
+            return ApprovalResult(False, "Automatic approval is unavailable")
+        logger.info("auto_application_received job_id=%s", job_id)
+        permission = ApplicationPermission(job_id, permit, self.settings.tg_user_id)
         sent = await self.sender.submit_application(permission)
         return ApprovalResult(sent, "Application sent" if sent else "Application failed")
 

@@ -2,6 +2,7 @@ import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -10,7 +11,7 @@ from config import load_settings
 from database import Database
 from hh_client import HHClient, PageState, VacancySummary, classify_page
 from tests.test_config import VALID_ENV, write_profile
-from vacancy_filter import title_rejection_reason
+from vacancy_filter import title_rejection_reason, vacancy_rejection_reason
 
 
 class FakeLocator:
@@ -87,6 +88,10 @@ class SearchPage(FakePage):
     def __init__(self, cards: list[SearchCard] | None = None):
         super().__init__()
         self.cards = cards or []
+        self.urls: list[str] = []
+
+    async def goto(self, url: str, **kwargs) -> None:
+        self.urls.append(url)
 
     def locator(self, selector: str) -> SearchLocator:
         return SearchLocator(self.cards)
@@ -121,6 +126,139 @@ class EmployerPage(FakePage):
 class FailingContext:
     async def new_page(self):
         raise RuntimeError("page creation failed")
+
+
+class RelocationWarningLocator:
+    def __init__(self, visible: bool):
+        self.visible = visible
+        self.clicked = False
+        self.first = self
+
+    async def is_visible(self) -> bool:
+        return self.visible
+
+    async def click(self) -> None:
+        self.clicked = True
+
+
+class RelocationWarningPage:
+    def __init__(self, visible: bool):
+        self.confirmation = RelocationWarningLocator(visible)
+
+    def locator(self, selector: str) -> RelocationWarningLocator:
+        assert selector == 'button[data-qa="relocation-warning-confirm"]'
+        return self.confirmation
+
+
+class PostSubmitCoverLetterLocator:
+    def __init__(self, page: "PostSubmitCoverLetterPage", kind: str):
+        self.page = page
+        self.kind = kind
+        self.first = self
+
+    async def is_visible(self) -> bool:
+        if self.kind == "attach":
+            return not self.page.form_open and not self.page.submitted
+        return self.page.form_open
+
+    async def click(self) -> None:
+        if self.kind == "attach":
+            self.page.form_open = True
+        elif self.kind == "submit":
+            self.page.form_open = False
+            self.page.submitted = True
+
+    async def wait_for(self, *, state: str, timeout: int) -> None:
+        visible = await self.is_visible()
+        if (state == "visible" and not visible) or (state == "hidden" and visible):
+            raise RuntimeError("unexpected locator state")
+
+    async def fill(self, value: str) -> None:
+        self.page.value = value
+
+    async def input_value(self) -> str:
+        return self.page.value
+
+
+class PostSubmitCoverLetterPage:
+    def __init__(self):
+        self.form_open = False
+        self.submitted = False
+        self.value = ""
+
+    def locator(self, selector: str) -> PostSubmitCoverLetterLocator:
+        if selector == 'button[data-qa="responded-success-attach-cover-letter"]':
+            return PostSubmitCoverLetterLocator(self, "attach")
+        if selector == 'textarea[data-qa="vacancy-response-popup-form-letter-input"]':
+            return PostSubmitCoverLetterLocator(self, "textarea")
+        if selector == 'button[data-qa="vacancy-response-letter-submit"]:visible':
+            return PostSubmitCoverLetterLocator(self, "submit")
+        raise AssertionError(selector)
+
+
+class ChatCoverLetterLocator:
+    def __init__(self, frame: "ChatCoverLetterFrame", kind: str):
+        self.frame = frame
+        self.kind = kind
+        self.first = self
+
+    async def wait_for(self, **kwargs) -> None:
+        return None
+
+    async def click(self) -> None:
+        if self.kind == "attach":
+            self.frame.form_open = True
+        elif self.kind == "send":
+            self.frame.sent = True
+
+    async def fill(self, value: str) -> None:
+        self.frame.value = value
+
+    async def input_value(self) -> str:
+        return self.frame.value
+
+    async def inner_text(self) -> str:
+        if self.kind == "body":
+            return self.frame.value if self.frame.sent else "Без сопроводительного письма"
+        return ""
+
+
+class ChatCoverLetterFrame:
+    url = "https://chatik.hh.ru/chat/123"
+
+    def __init__(self):
+        self.form_open = False
+        self.sent = False
+        self.value = ""
+
+    def locator(self, selector: str) -> ChatCoverLetterLocator:
+        if selector == "body":
+            return ChatCoverLetterLocator(self, "body")
+        if selector == 'textarea[data-qa="text-input"]':
+            return ChatCoverLetterLocator(self, "textarea")
+        if selector == 'button[data-qa="chatik-do-send-message"]':
+            return ChatCoverLetterLocator(self, "send")
+        raise AssertionError(selector)
+
+    def get_by_text(self, text: str, *, exact: bool) -> ChatCoverLetterLocator:
+        assert text == "Добавить сопроводительное"
+        assert not exact
+        return ChatCoverLetterLocator(self, "attach")
+
+    async def wait_for_function(self, expression: str, arg: str, **kwargs) -> None:
+        assert "innerText.includes" in expression
+        if not self.sent or arg not in self.value:
+            raise RuntimeError("cover letter not visible")
+
+
+class ChatCoverLetterPage:
+    def __init__(self):
+        self.frame = ChatCoverLetterFrame()
+        self.frames = [self.frame]
+
+    def locator(self, selector: str) -> ChatCoverLetterLocator:
+        assert selector == 'button[data-qa="vacancy-response-link-view-topic"]'
+        return ChatCoverLetterLocator(self.frame, "chat")
 
 
 class RetryLoginPage(FakePage):
@@ -332,6 +470,28 @@ def test_search_counts_found_new_and_existing_results(tmp_path: Path) -> None:
     assert [item.id for item in result.summaries] == ["135006928"]
 
 
+def test_search_adds_hh_remote_schedule_only_when_requested(tmp_path: Path) -> None:
+    settings = replace(
+        load_settings(profile_path=write_profile(tmp_path), environ=VALID_ENV),
+        database_path=tmp_path / "agent.db",
+        min_seconds_between_actions=0,
+        max_pages_per_query=1,
+    )
+    database = Database(settings.database_path)
+    database.init()
+    page = SearchPage([])
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    client = HHClient(
+        FakeContext(page), settings, database, ApprovalGuard(settings, database), sleep=no_sleep
+    )
+    asyncio.run(client.search_vacancies("DevOps", (), (), remote_only=True))
+
+    assert parse_qs(urlparse(page.urls[0]).query)["schedule"] == ["remote"]
+
+
 def test_search_returns_only_pending_existing_vacancies_as_repeats(
     tmp_path: Path,
 ) -> None:
@@ -509,10 +669,91 @@ def test_captcha_solution_uses_submit_button(tmp_path: Path) -> None:
     assert page.actions == ["click:submit"]
 
 
+@pytest.mark.parametrize("visible", [True, False])
+def test_relocation_warning_is_confirmed_only_when_hh_shows_it(
+    tmp_path: Path, visible: bool
+) -> None:
+    settings = replace(
+        load_settings(profile_path=write_profile(tmp_path), environ=VALID_ENV),
+        database_path=tmp_path / "agent.db",
+        min_seconds_between_actions=0,
+    )
+    database = Database(settings.database_path)
+    database.init()
+    page = RelocationWarningPage(visible)
+    client = HHClient(
+        FakeContext(FakePage()),
+        settings,
+        database,
+        ApprovalGuard(settings, database),
+        sleep=lambda _: asyncio.sleep(0),
+    )
+
+    confirmed = asyncio.run(client._confirm_relocation_warning(page))
+
+    assert confirmed is visible
+    assert page.confirmation.clicked is visible
+
+
+def test_post_submit_cover_letter_is_filled_verified_and_sent(tmp_path: Path) -> None:
+    settings = replace(
+        load_settings(profile_path=write_profile(tmp_path), environ=VALID_ENV),
+        database_path=tmp_path / "agent.db",
+        min_seconds_between_actions=0,
+    )
+    database = Database(settings.database_path)
+    database.init()
+    page = PostSubmitCoverLetterPage()
+    client = HHClient(
+        FakeContext(page),
+        settings,
+        database,
+        ApprovalGuard(settings, database),
+        sleep=lambda _: asyncio.sleep(0),
+    )
+    portfolio = settings.profile.cover_letter.required_portfolio_url
+    letter = f"Relevant experience.\n\n{portfolio}"
+
+    asyncio.run(client._attach_cover_letter_after_response(page, letter, portfolio))
+
+    assert page.value == letter
+    assert page.submitted
+
+
+def test_missing_cover_letter_is_attached_and_verified_inside_chat_frame(
+    tmp_path: Path,
+) -> None:
+    settings = replace(
+        load_settings(profile_path=write_profile(tmp_path), environ=VALID_ENV),
+        database_path=tmp_path / "agent.db",
+        min_seconds_between_actions=0,
+    )
+    database = Database(settings.database_path)
+    database.init()
+    page = ChatCoverLetterPage()
+    client = HHClient(
+        FakeContext(page),
+        settings,
+        database,
+        ApprovalGuard(settings, database),
+        sleep=lambda _: asyncio.sleep(0),
+    )
+    portfolio = "https://portfolio.example/candidate"
+    letter = f"Relevant experience.\n\nПортфолио: {portfolio}"
+
+    asyncio.run(client._ensure_cover_letter_in_chat(page, letter, portfolio))
+
+    assert page.frame.sent
+    assert page.frame.value == letter
+
+
 @pytest.mark.parametrize(
     ("title", "excluded", "expected"),
     [
-        ("Senior Python developer", (), "senior"),
+        ("Senior Python developer", (), None),
+        ("Senior Product Designer", (), None),
+        ("Продуктовый дизайнер", (), None),
+        ("Lead UX/UI Designer", ("lead",), "lead"),
         ("Python sales engineer", ("sales",), "sales"),
         ("Python developer", (), None),
     ],
@@ -521,3 +762,25 @@ def test_title_filter_returns_the_matched_reason(
     title: str, excluded: tuple[str, ...], expected: str | None
 ) -> None:
     assert title_rejection_reason(title, excluded) == expected
+
+
+@pytest.mark.parametrize(
+    ("title", "company", "description", "expected"),
+    [
+        ("Team Lead Product Designer", "Example", "Product work", "position:team lead"),
+        ("Product Designer", "Blocked Corp", "Product work", "company:blocked"),
+        ("Product Designer", "Example", "Разработка мобильных игр", "keyword:мобильных игр"),
+        ("Product Designer", "Example", "Product work", None),
+    ],
+)
+def test_vacancy_filter_checks_position_company_and_industry(
+    title: str, company: str, description: str, expected: str | None
+) -> None:
+    assert vacancy_rejection_reason(
+        title=title,
+        company=company,
+        description=description,
+        excluded_positions=("team lead",),
+        excluded_companies=("blocked",),
+        excluded_keywords=("разработка игр", "мобильных игр"),
+    ) == expected

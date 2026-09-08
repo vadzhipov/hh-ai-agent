@@ -19,6 +19,7 @@ def create_llm_provider(settings: Settings, database: Database) -> LLMProvider:
             config.openai_compatible_base_url,
             config.openai_compatible_api_key,
             json_mode=config.openai_compatible_json_mode,
+            reasoning_enabled=config.openai_compatible_reasoning_enabled,
         )
     else:
         raise LLMConfigurationError()

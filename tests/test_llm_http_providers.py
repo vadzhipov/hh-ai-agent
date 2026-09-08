@@ -1,4 +1,5 @@
 import asyncio
+import json
 from typing import Any
 
 import pytest
@@ -137,7 +138,11 @@ def test_openai_compatible_posts_only_to_chat_completions() -> None:
     assert call["json"] == {
         "model": "chosen-model",
         "messages": [
-            {"role": "system", "content": "System boundary"},
+            {
+                "role": "system",
+                "content": 'System boundary\nReturn only a JSON object matching this JSON schema:\n'
+                '{"type": "object", "required": ["suitable"]}',
+            },
             {"role": "user", "content": "User JSON"},
         ],
         "temperature": 0.2,
@@ -161,6 +166,38 @@ def test_openai_compatible_can_disable_best_effort_json_mode() -> None:
     asyncio.run(provider.complete(request(structured=True)))
 
     assert "response_format" not in session.calls[0][1]["json"]
+    system = session.calls[0][1]["json"]["messages"][0]["content"]
+    assert json.loads(system.splitlines()[-1]) == request(structured=True).json_schema
+
+
+def test_openai_compatible_plain_text_preserves_instructions() -> None:
+    session = FakeSession(
+        [FakeResponse(data={"choices": [{"message": {"content": "letter"}}]})]
+    )
+    provider = OpenAICompatibleProvider(
+        "https://provider.example/v1", "key", json_mode=True, session=session
+    )
+
+    assert asyncio.run(provider.complete(request())).text == "letter"
+    payload = session.calls[0][1]["json"]
+    assert payload["messages"][0]["content"] == "System boundary"
+    assert "response_format" not in payload
+    assert "reasoning" not in payload
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_openai_compatible_reasoning_is_explicit_opt_in(enabled: bool) -> None:
+    session = FakeSession(
+        [FakeResponse(data={"choices": [{"message": {"content": "letter"}}]})]
+    )
+    provider = OpenAICompatibleProvider(
+        "https://openrouter.ai/api/v1", "key", json_mode=True,
+        reasoning_enabled=enabled, session=session,
+    )
+
+    asyncio.run(provider.complete(request()))
+
+    assert session.calls[0][1]["json"]["reasoning"] == {"enabled": enabled}
 
 
 @pytest.mark.parametrize(

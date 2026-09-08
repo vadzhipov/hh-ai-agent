@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import Any
 
@@ -25,11 +26,13 @@ class OpenAICompatibleProvider:
         api_key: str,
         *,
         json_mode: bool,
+        reasoning_enabled: bool | None = None,
         session: Any = None,
     ):
         self.url = f"{base_url.rstrip('/')}/chat/completions"
         self.api_key = api_key
         self.json_mode = json_mode
+        self.reasoning_enabled = reasoning_enabled
         self._session = session
         self._owns_session = session is None
 
@@ -39,10 +42,16 @@ class OpenAICompatibleProvider:
         return self._session
 
     async def complete(self, request: LLMRequest) -> LLMResponse:
+        system_instructions = request.system_instructions
+        if request.json_schema is not None:
+            system_instructions += (
+                "\nReturn only a JSON object matching this JSON schema:\n"
+                + json.dumps(request.json_schema, ensure_ascii=False)
+            )
         payload: dict[str, object] = {
             "model": request.model,
             "messages": [
-                {"role": "system", "content": request.system_instructions},
+                {"role": "system", "content": system_instructions},
                 {"role": "user", "content": request.user_content},
             ],
             "temperature": request.temperature,
@@ -50,6 +59,8 @@ class OpenAICompatibleProvider:
         }
         if request.json_schema is not None and self.json_mode:
             payload["response_format"] = {"type": "json_object"}
+        if self.reasoning_enabled is not None:
+            payload["reasoning"] = {"enabled": self.reasoning_enabled}
         started = time.perf_counter()
         try:
             async with self._get_session().post(

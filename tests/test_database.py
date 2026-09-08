@@ -522,6 +522,119 @@ def test_failed_final_submit_attempt_keeps_daily_reservation(tmp_path: Path) -> 
     assert not claim(database, "job-2", second_token, daily_limit=1).allowed
 
 
+def test_only_pre_submit_failure_can_be_requeued_for_new_approval(tmp_path: Path) -> None:
+    database = make_database(tmp_path)
+    token = approve(database)
+    assert claim(database, "job-1", token).allowed
+    assert database.complete_application(
+        "job-1",
+        token,
+        success=False,
+        now=NOW + timedelta(minutes=3),
+        error_text="cover letter field unavailable",
+    )
+
+    assert database.requeue_pre_submit_failure("job-1")
+    requeued = database.get("job-1")
+    assert requeued.status is VacancyStatus.DISCOVERED
+    assert requeued.cover_letter == "Letter"
+    assert requeued.applying_at is None
+    assert requeued.submit_attempted_at is None
+    assert requeued.error_text == ""
+
+    assert database.request_approval(
+        job_id="job-1",
+        cover_letter=requeued.cover_letter,
+        llm_decision=True,
+        llm_reason=requeued.llm_reason,
+        confidence=requeued.confidence or 0.0,
+        now=NOW + timedelta(minutes=4),
+    )
+
+
+def test_submit_attempt_failure_cannot_be_requeued(tmp_path: Path) -> None:
+    database = make_database(tmp_path)
+    token = approve(database)
+    assert claim(database, "job-1", token).allowed
+    assert database.mark_submit_attempt(
+        "job-1", token, now=NOW + timedelta(minutes=3), daily_limit=5
+    )
+    assert database.complete_application(
+        "job-1", token, success=False, now=NOW + timedelta(minutes=3)
+    )
+
+    assert not database.requeue_pre_submit_failure("job-1")
+    assert database.get("job-1").status is VacancyStatus.APPLY_FAILED
+
+
+def test_available_application_slots_reserves_submitted_failure(tmp_path: Path) -> None:
+    database = make_database(tmp_path)
+    token = approve(database)
+    assert claim(database, "job-1", token).allowed
+    assert database.mark_submit_attempt(
+        "job-1", token, now=NOW + timedelta(minutes=3), daily_limit=20
+    )
+    assert database.complete_application(
+        "job-1", token, success=False, now=NOW + timedelta(minutes=3)
+    )
+
+    assert database.available_application_slots(
+        daily_limit=20, now=NOW + timedelta(minutes=4)
+    ) == 19
+
+
+def test_existing_response_repair_reconciles_status_and_daily_limit(
+    tmp_path: Path,
+) -> None:
+    database = make_database(tmp_path)
+    token = approve(database)
+    assert claim(database, "job-1", token).allowed
+    assert database.complete_application(
+        "job-1",
+        token,
+        success=False,
+        now=NOW + timedelta(minutes=3),
+        error_text="cover letter field unavailable",
+    )
+
+    repaired_at = NOW + timedelta(minutes=4)
+    assert database.complete_existing_response_repair(
+        "job-1", now=repaired_at, cover_letter="Verified repaired letter"
+    )
+    repaired = database.get("job-1")
+    assert repaired.status is VacancyStatus.APPLIED
+    assert repaired.submit_attempted_at == (NOW + timedelta(minutes=2)).isoformat()
+    assert repaired.applied_at == repaired_at.isoformat()
+    assert repaired.cover_letter == "Verified repaired letter"
+    assert repaired.error_text == ""
+    assert database.available_application_slots(
+        daily_limit=20, now=repaired_at
+    ) == 19
+    assert not database.complete_existing_response_repair(
+        "job-1", now=repaired_at
+    )
+
+
+def test_applied_cover_letter_repair_records_exact_sent_text(tmp_path: Path) -> None:
+    database = make_database(tmp_path)
+    token = approve(database, letter="Old broken letter")
+    assert claim(database, "job-1", token).allowed
+    assert database.mark_submit_attempt(
+        "job-1", token, now=NOW + timedelta(minutes=3), daily_limit=5
+    )
+    assert database.complete_application(
+        "job-1", token, success=True, now=NOW + timedelta(minutes=4)
+    )
+
+    assert database.record_applied_cover_letter_repair(
+        "job-1", "Exact repaired letter."
+    )
+    repaired = database.get("job-1")
+    assert repaired.status is VacancyStatus.APPLIED
+    assert repaired.cover_letter == "Exact repaired letter."
+    assert repaired.applied_at == (NOW + timedelta(minutes=4)).isoformat()
+
+
 def test_concurrent_claim_has_one_winner(tmp_path: Path) -> None:
     database = make_database(tmp_path)
     token = approve(database)

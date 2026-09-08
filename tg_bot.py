@@ -29,6 +29,7 @@ from aiogram.types import (
 
 from approval import ApprovalService
 from config import Settings
+from cover_letter import has_required_portfolio
 from database import Database, Vacancy
 from fit_summary import FIT_SUMMARY_FALLBACK
 from llm.errors import LLMError
@@ -112,12 +113,23 @@ class TelegramService:
             stats = self.database.stats()
             processed = sum(stats.values())
             version_str = f"v{__version__}"
+            auto_apply = self.settings.auto_apply
+            auto_line = (
+                "enabled "
+                f"(≥{auto_apply.min_confidence:.2f}, "
+                f"{auto_apply.min_batch_size}–{auto_apply.max_batch_size} за пачку, "
+                f"{auto_apply.start_hour:02d}:00–{auto_apply.end_hour:02d}:00 "
+                f"{auto_apply.timezone})"
+                if auto_apply.enabled
+                else "disabled"
+            )
             if self.latest_release is not None:
                 version_str += f" (доступно обновление {self.latest_release.tag_name})"
             return (
                 f"версия: {version_str}\n"
                 f"mode: {self.settings.app_mode}\n"
                 f"state: {'paused' if self.control.paused else 'running'}\n"
+                f"auto apply: {auto_line}\n"
                 f"processed: {processed}\n"
                 f"applied today: {self.database.applied_today(self.now_factory())}"
             )
@@ -276,6 +288,11 @@ class TelegramService:
             try:
                 new_letter = await asyncio.wait_for(self._edit_future, timeout=300)
                 if new_letter:
+                    if not has_required_portfolio(
+                        new_letter, self.settings.profile.cover_letter.required_portfolio_url
+                    ):
+                        await self.notify("Письмо не сохранено: добавьте обязательную ссылку на портфолио.")
+                        return
                     self.database.update_cover_letter(job_id, new_letter)
                     await self.notify("✓ Сопроводительное письмо обновлено!")
                     updated_vacancy = self.database.get(job_id)
@@ -770,7 +787,7 @@ class TelegramService:
     async def start_polling(self) -> None:
         while True:
             try:
-                await self.dispatcher.start_polling(self.bot)
+                await self.dispatcher.start_polling(self.bot, handle_signals=False)
                 break
             except asyncio.CancelledError:
                 break

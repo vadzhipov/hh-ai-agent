@@ -393,6 +393,20 @@ class Database:
             )
             return cursor.rowcount == 1
 
+    def record_applied_cover_letter_repair(
+        self, job_id: str, cover_letter: str
+    ) -> bool:
+        """Store the exact letter after it was attached to an existing response."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE vacancies SET cover_letter = ?, error_text = ''
+                WHERE id = ? AND status = ? AND applied_at IS NOT NULL
+                """,
+                (cover_letter, job_id, VacancyStatus.APPLIED.value),
+            )
+            return cursor.rowcount == 1
+
     @staticmethod
 
     def _vacancy(row: sqlite3.Row | None) -> Vacancy | None:
@@ -782,6 +796,71 @@ class Database:
             )
             return cursor.rowcount == 1
 
+    def requeue_pre_submit_failure(self, job_id: str) -> bool:
+        """Allow a new approval only when HH was never asked to submit the response."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE vacancies SET
+                    status = ?, approval_requested_at = NULL, approval_expires_at = NULL,
+                    approved_at = NULL, applying_at = NULL, approver_id = NULL,
+                    permit_hash = NULL, error_text = ''
+                WHERE id = ? AND status = ?
+                  AND submit_attempted_at IS NULL AND applied_at IS NULL
+                """,
+                (
+                    VacancyStatus.DISCOVERED.value,
+                    job_id,
+                    VacancyStatus.APPLY_FAILED.value,
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def complete_existing_response_repair(
+        self,
+        job_id: str,
+        *,
+        now: datetime,
+        cover_letter: str | None = None,
+    ) -> bool:
+        """Reconcile a response after its missing cover letter was attached."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE vacancies SET
+                    status = ?,
+                    submit_attempted_at = COALESCE(submit_attempted_at, applying_at, ?),
+                    applied_at = ?,
+                    cover_letter = COALESCE(?, cover_letter),
+                    error_text = ''
+                WHERE id = ? AND status = ?
+                    AND applied_at IS NULL AND cover_letter <> ''
+                """,
+                (
+                    VacancyStatus.APPLIED.value,
+                    _iso(now),
+                    _iso(now),
+                    cover_letter,
+                    job_id,
+                    VacancyStatus.APPLY_FAILED.value,
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def clear_verified_unsubmitted_attempt(self, job_id: str) -> bool:
+        """Release a reservation after HH proves the response is still available."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE vacancies SET submit_attempted_at = NULL
+                WHERE id = ? AND status = ? AND applied_at IS NULL
+                    AND submit_attempted_at IS NOT NULL
+                    AND error_text = 'questionnaire_required'
+                """,
+                (job_id, VacancyStatus.APPLY_FAILED.value),
+            )
+            return cursor.rowcount == 1
+
     def mark_submit_attempt(
         self,
         job_id: str,
@@ -878,6 +957,12 @@ class Database:
     def applied_today(self, now: datetime) -> int:
         with self._connect() as connection:
             return self._applied_today(connection, now)
+
+    def available_application_slots(self, *, daily_limit: int, now: datetime) -> int:
+        if daily_limit < 1:
+            raise ValueError("daily_limit must be positive")
+        with self._connect() as connection:
+            return max(0, daily_limit - self._reserved_today(connection, now))
 
     def reserve_llm_request(
         self,

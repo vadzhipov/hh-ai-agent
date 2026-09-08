@@ -4,12 +4,14 @@ import argparse
 import asyncio
 import hashlib
 import logging
+import random
 import sys
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from aiogram.exceptions import TelegramAPIError
 
@@ -20,6 +22,7 @@ from config import ConfigError, Settings, load_settings
 from database import Database, SearchRun, VacancyStatus
 from fit_summary import normalize_fit_summary
 from hh_client import HHClient, PageState, VacancySummary
+from instance_lock import AlreadyRunningError, single_instance
 from llm.base import LLMProvider
 from llm.errors import LLMError
 from llm.factory import create_llm_provider
@@ -27,7 +30,7 @@ from llm.mistral_keys import MistralKeyManager
 from llm.types import LLMRequest
 from logging_setup import configure_logging
 from tg_bot import AgentControl, TelegramService
-from vacancy_filter import title_rejection_reason
+from vacancy_filter import vacancy_rejection_reason
 from version import __version__
 
 
@@ -51,6 +54,7 @@ class SearchRunStats:
     rejected_by_filter: int = 0
     rejected_by_llm: int = 0
     telegram_cards: int = 0
+    auto_applications: int = 0
     error_count: int = 0
     rejection_reasons: Counter[str] = field(default_factory=Counter)
     error_reasons: Counter[str] = field(default_factory=Counter)
@@ -73,6 +77,8 @@ class SearchRunStats:
             self.rejection_reasons["llm_rejected"] += 1
         elif result.outcome == "telegram_card":
             self.telegram_cards += 1
+        elif result.outcome == "auto_applied":
+            self.auto_applications += 1
         elif result.outcome == "other_error":
             self.record_error(result.reason or "other_error")
 
@@ -102,6 +108,83 @@ class SearchRunStats:
         return ""
 
 
+def next_auto_batch_at(
+    after: datetime, settings: Settings, *, interval_hours: int = 0
+) -> datetime:
+    schedule = settings.auto_apply
+    local = after.astimezone(ZoneInfo(schedule.timezone))
+    window_start = local.replace(
+        hour=schedule.start_hour, minute=0, second=0, microsecond=0
+    )
+    window_end = local.replace(
+        hour=schedule.end_hour, minute=0, second=0, microsecond=0
+    )
+    if local < window_start:
+        return window_start
+    if local >= window_end:
+        return window_start + timedelta(days=1)
+    candidate = local + timedelta(hours=interval_hours)
+    return candidate if candidate < window_end else window_start + timedelta(days=1)
+
+
+def next_auto_window_start_after(after: datetime, settings: Settings) -> datetime:
+    schedule = settings.auto_apply
+    local = after.astimezone(ZoneInfo(schedule.timezone))
+    window_start = local.replace(
+        hour=schedule.start_hour, minute=0, second=0, microsecond=0
+    )
+    return window_start if local < window_start else window_start + timedelta(days=1)
+
+
+def restored_auto_batch_at(
+    now: datetime,
+    settings: Settings,
+    database: Database,
+    *,
+    interval_hours: int,
+) -> datetime:
+    """Keep a restarted auto-apply process from starting a second batch early."""
+    previous = database.latest_search_run()
+    if previous is None:
+        return next_auto_batch_at(now, settings)
+    try:
+        finished_at = datetime.fromisoformat(previous.finished_at)
+    except ValueError:
+        logger.warning("auto_schedule_restore_failed run_id=%s", previous.id)
+        return next_auto_batch_at(now, settings)
+    return next_auto_batch_at(
+        finished_at, settings, interval_hours=interval_hours
+    )
+
+
+def format_auto_batch_report(
+    run: SearchRun,
+    *,
+    auto_applied: int,
+    next_batch: datetime | None,
+    settings: Settings,
+) -> str:
+    lines = [
+        "Итог автоподачи",
+        f"Найдено: {run.found_results}; новых: {run.new_vacancies}.",
+        f"Отправлено: {auto_applied}; на ручную проверку: {run.telegram_cards}.",
+        (
+            "Отсечено фильтрами: "
+            f"{run.rejected_by_filter + run.rejected_by_llm}; "
+            f"безопасно остановлено: {run.error_count}."
+        ),
+    ]
+    if next_batch is None:
+        lines.append("Следующая пачка не назначена: автоподача приостановлена.")
+    else:
+        local_next = next_batch.astimezone(ZoneInfo(settings.auto_apply.timezone))
+        lines.append(
+            f"Следующая пачка: {local_next.strftime('%d.%m %H:%M')} "
+            f"{settings.auto_apply.timezone}."
+        )
+    return "\n".join(lines)
+
+
 async def process_vacancy(
     summary: VacancySummary,
     settings: Settings,
@@ -110,6 +193,7 @@ async def process_vacancy(
     analyzer: VacancyAnalyzer,
     telegram: TelegramService,
     *,
+    approval_service: ApprovalService | None = None,
     now_factory: Callable[[], datetime] | None = None,
 ) -> VacancyProcessResult:
     clock = now_factory or (lambda: datetime.now(UTC))
@@ -162,15 +246,20 @@ async def process_vacancy(
         logger.error("vacancy_read_failed job_id=%s state=%s", summary.id, details.state.value)
         return VacancyProcessResult("other_error", details.state.value, details.state)
 
-    rejection = title_rejection_reason(
-        summary.title, settings.profile.candidate.excluded_positions
+    rejection = vacancy_rejection_reason(
+        title=summary.title,
+        company=details.company,
+        description=details.description,
+        excluded_positions=settings.profile.candidate.excluded_positions,
+        excluded_companies=settings.profile.candidate.excluded_companies,
+        excluded_keywords=settings.profile.candidate.excluded_keywords,
     )
     if rejection:
         database.transition(
             summary.id,
             VacancyStatus.DISCOVERED,
             VacancyStatus.REJECTED_BY_FILTER,
-            llm_reason=f"Title matched excluded term: {rejection}",
+            llm_reason=f"Excluded by profile filter: {rejection}",
         )
         logger.info("vacancy_rejected job_id=%s source=filter", summary.id)
         return VacancyProcessResult(
@@ -216,7 +305,9 @@ async def process_vacancy(
         summary.id, rating=company.rating, reviews_count=company.reviews_count
     )
 
-    letter = await analyzer.generate_cover_letter(summary.title, details.description)
+    letter = await analyzer.generate_cover_letter(
+        summary.title, details.description, company_name=details.company
+    )
     if not letter.strip():
         database.transition(
             summary.id,
@@ -251,6 +342,34 @@ async def process_vacancy(
         return VacancyProcessResult(
             "other_error", "approval_transition_failed", PageState.VACANCY_LOADED
         )
+    elif (
+        settings.auto_apply.enabled
+        and suitability.confidence >= settings.auto_apply.min_confidence
+    ):
+        if approval_service is None:
+            return VacancyProcessResult(
+                "other_error", "auto_apply_service_unavailable", PageState.VACANCY_LOADED
+            )
+        auto_result = await approval_service.auto_apply(summary.id)
+        vacancy = database.get(summary.id)
+        if auto_result.ok:
+            try:
+                await telegram.notify(
+                    f"✓ Автоотклик отправлен: {vacancy.title if vacancy else summary.title}"
+                )
+            except TelegramAPIError:
+                logger.warning("auto_application_notification_failed job_id=%s", summary.id)
+            return VacancyProcessResult("auto_applied", page_state=PageState.VACANCY_LOADED)
+        try:
+            await telegram.notify(
+                f"✗ Автоотклик не отправлен: {vacancy.title if vacancy else summary.title}. "
+                f"{auto_result.message}"
+            )
+        except TelegramAPIError:
+            logger.warning("auto_application_notification_failed job_id=%s", summary.id)
+        return VacancyProcessResult(
+            "other_error", "auto_apply_failed", PageState.VACANCY_LOADED
+        )
     try:
         await telegram.send_preview(
             database.get(summary.id), include_actions=include_actions
@@ -270,8 +389,12 @@ async def run_search_cycle(
     telegram: TelegramService,
     control: AgentControl,
     *,
+    approval_service: ApprovalService | None = None,
+    auto_apply_batch_limit: int | None = None,
     now_factory: Callable[[], datetime] | None = None,
 ) -> SearchRun:
+    if auto_apply_batch_limit is not None and auto_apply_batch_limit < 1:
+        raise ValueError("auto_apply_batch_limit must be positive")
     now = now_factory or (lambda: datetime.now(UTC))
     started_at = now()
     stats = SearchRunStats()
@@ -295,10 +418,22 @@ async def run_search_cycle(
             hh_client,
             analyzer,
             telegram,
+            approval_service=approval_service,
             now_factory=now,
         )
         stats.record(result)
-        circuit_reason = stats.circuit_reason(settings)
+        if result.reason == "auto_apply_failed":
+            failed_application = database.get(summary.id)
+            if (
+                failed_application is not None
+                and failed_application.submit_attempted_at is not None
+            ):
+                circuit_reason = "application_delivery_uncertain"
+                state = "paused_by_circuit_breaker"
+                control.paused = True
+                control.circuit_reason = circuit_reason
+        if not circuit_reason:
+            circuit_reason = stats.circuit_reason(settings)
         if circuit_reason:
             state = "paused_by_circuit_breaker"
             control.paused = True
@@ -310,7 +445,10 @@ async def run_search_cycle(
             now(), max_attempts=ANALYSIS_MAX_ATTEMPTS
         )
         for vacancy in database.unprocessed_discovered():
-            if control.paused:
+            if control.paused or (
+                auto_apply_batch_limit is not None
+                and stats.auto_applications >= auto_apply_batch_limit
+            ):
                 break
             await process(
                 VacancySummary(
@@ -321,13 +459,17 @@ async def run_search_cycle(
                 )
             )
         for query in settings.profile.hh.search_queries:
-            if control.paused:
+            if control.paused or (
+                auto_apply_batch_limit is not None
+                and stats.auto_applications >= auto_apply_batch_limit
+            ):
                 break
             logger.info("search_query_started query=%r", query)
             search = await hh_client.search_vacancies(
                 query,
                 settings.profile.hh.areas,
                 settings.profile.hh.experience_filters,
+                remote_only=settings.profile.hh.remote_only,
             )
             stats.query_count += 1
             stats.found_results += search.found_results
@@ -356,7 +498,10 @@ async def run_search_cycle(
                 control.paused = True
                 control.circuit_reason = circuit_reason
             for summary in search.summaries:
-                if control.paused:
+                if control.paused or (
+                    auto_apply_batch_limit is not None
+                    and stats.auto_applications >= auto_apply_batch_limit
+                ):
                     break
                 await process(summary)
         if not control.paused:
@@ -371,7 +516,11 @@ async def run_search_cycle(
             f"Поиск приостановлен: {circuit_reason}. "
             "Проверьте /diagnostics и выполните /resume после устранения причины."
         )
-    elif state == "completed" and stats.telegram_cards == 0:
+    elif (
+        auto_apply_batch_limit is None
+        and state == "completed"
+        and stats.telegram_cards == 0
+    ):
         reasons = (stats.rejection_reasons + stats.error_reasons).most_common(3)
         reason_text = ", ".join(f"{name}={count}" for name, count in reasons)
         notification = (
@@ -410,9 +559,10 @@ async def run_search_cycle(
     if result is None:
         raise RuntimeError("search run was not saved")
     logger.info(
-        "search_cycle_finished state=%s cards=%s errors=%s",
+        "search_cycle_finished state=%s cards=%s auto_applied=%s errors=%s",
         result.state,
         result.telegram_cards,
+        stats.auto_applications,
         result.error_count,
     )
     return result
@@ -461,9 +611,89 @@ async def agent_loop(
     analyzer: VacancyAnalyzer,
     telegram: TelegramService,
     control: AgentControl,
+    approval_service: ApprovalService | None = None,
+    *,
+    now_factory: Callable[[], datetime] | None = None,
+    randint: Callable[[int, int], int] = random.randint,
 ) -> None:
+    clock = now_factory or (lambda: datetime.now(UTC))
+    next_auto_batch: datetime | None = None
     while True:
-        if not control.paused:
+        wake_timeout_seconds = settings.check_interval_minutes * 60
+        if control.paused:
+            control.next_run_at = None
+        elif settings.auto_apply.enabled:
+            now = clock()
+            next_auto_batch = next_auto_batch or restored_auto_batch_at(
+                now,
+                settings,
+                database,
+                interval_hours=randint(
+                    settings.auto_apply.min_interval_hours,
+                    settings.auto_apply.max_interval_hours,
+                ),
+            )
+            if now >= next_auto_batch:
+                remaining = database.available_application_slots(
+                    daily_limit=settings.max_applications_per_day, now=now
+                )
+                if remaining:
+                    applications_before = database.applied_today(now)
+                    batch_size = min(
+                        randint(
+                            settings.auto_apply.min_batch_size,
+                            settings.auto_apply.max_batch_size,
+                        ),
+                        remaining,
+                    )
+                    run = await run_search_cycle(
+                        settings,
+                        database,
+                        hh_client,
+                        analyzer,
+                        telegram,
+                        control,
+                        approval_service=approval_service,
+                        auto_apply_batch_limit=batch_size,
+                        now_factory=clock,
+                    )
+                    if control.paused:
+                        control.next_run_at = None
+                    else:
+                        next_auto_batch = next_auto_batch_at(
+                            clock(),
+                            settings,
+                            interval_hours=randint(
+                                settings.auto_apply.min_interval_hours,
+                                settings.auto_apply.max_interval_hours,
+                            ),
+                        )
+                        control.next_run_at = next_auto_batch
+                    try:
+                        await telegram.notify(
+                            format_auto_batch_report(
+                                run,
+                                auto_applied=max(
+                                    0,
+                                    database.applied_today(clock())
+                                    - applications_before,
+                                ),
+                                next_batch=control.next_run_at,
+                                settings=settings,
+                            )
+                        )
+                    except TelegramAPIError:
+                        logger.warning("auto_batch_report_notification_failed")
+                else:
+                    next_auto_batch = next_auto_window_start_after(now, settings)
+                    control.next_run_at = next_auto_batch
+            else:
+                control.next_run_at = next_auto_batch
+            if control.next_run_at is not None:
+                wake_timeout_seconds = max(
+                    0.0, (control.next_run_at - clock()).total_seconds()
+                )
+        else:
             run = await run_search_cycle(
                 settings, database, hh_client, analyzer, telegram, control
             )
@@ -473,17 +703,20 @@ async def agent_loop(
                 else datetime.fromisoformat(run.finished_at)
                 + timedelta(minutes=settings.check_interval_minutes)
             )
-        else:
-            control.next_run_at = None
+            wake_timeout_seconds = settings.check_interval_minutes * 60
+        wake_received = False
         try:
             await asyncio.wait_for(
-                control.wake_event.wait(), settings.check_interval_minutes * 60
+                control.wake_event.wait(), wake_timeout_seconds
             )
+            wake_received = True
         except TimeoutError:
             pass
         finally:
             control.wake_event.clear()
             control.next_run_at = None
+        if wake_received:
+            next_auto_batch = None
 
 
 async def run(settings: Settings) -> None:
@@ -515,7 +748,15 @@ async def run(settings: Settings) -> None:
             asyncio.create_task(telegram.check_updates(notify=True))
         await asyncio.gather(
             telegram.start_polling(),
-            agent_loop(settings, database, hh_client, analyzer, telegram, control),
+            agent_loop(
+                settings,
+                database,
+                hh_client,
+                analyzer,
+                telegram,
+                control,
+                approval_service,
+            ),
         )
     finally:
         try:
@@ -594,8 +835,14 @@ def cli(
             return 1
         return 0
     configure_logging(settings.log_path)
+    lock_path = settings.database_path.with_name(f"{settings.database_path.name}.lock")
     try:
-        asyncio.run(run(settings))
+        with single_instance(lock_path):
+            asyncio.run(run(settings))
+    except AlreadyRunningError as exc:
+        logger.info("startup_skipped reason=already_running")
+        print(exc, file=sys.stderr)
+        return 0
     except (BrowserLaunchError, RuntimeError) as exc:
         logger.error("startup_failed error=%s", exc)
         print(exc, file=sys.stderr)

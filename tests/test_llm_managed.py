@@ -1,5 +1,6 @@
 import asyncio
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -133,6 +134,23 @@ def test_zero_retries_disables_rate_limit_retry(tmp_path: Path) -> None:
     with pytest.raises(LLMRateLimitError):
         asyncio.run(provider.generate_text(request()))
 
+    assert len(adapter.requests) == 1
+
+
+@pytest.mark.parametrize("structured", [True, False])
+def test_length_limited_response_is_rejected_even_when_parseable(
+    tmp_path: Path, structured: bool
+) -> None:
+    truncated = replace(
+        response('{"suitable":true,"confidence":0.9}'), finish_reason="length"
+    )
+    provider, adapter, _ = managed(tmp_path, [truncated], max_retries=0)
+
+    with pytest.raises(LLMInvalidResponseError):
+        if structured:
+            asyncio.run(provider.generate_structured(request(structured=True), StructuredAnswer))
+        else:
+            asyncio.run(provider.generate_text(request()))
     assert len(adapter.requests) == 1
 
 

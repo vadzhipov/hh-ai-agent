@@ -7,6 +7,7 @@ import pytest
 
 from ai_analyzer import AnalysisError, SuitabilityResult, VacancyAnalyzer
 from config import load_settings
+from cover_letter import cover_letter_validation_error, has_required_portfolio
 from database import Database
 from llm.managed import ManagedLLMProvider
 from llm.providers.fake import FakeProvider
@@ -197,19 +198,23 @@ def test_unsafe_cover_letter_forms_are_rejected(tmp_path: Path, raw: str) -> Non
     )
 
 
-def test_cover_letter_preserves_quotes_and_apostrophes_and_truncates(
+def test_cover_letter_preserves_quotes_and_apostrophes_and_retries_instead_of_truncating(
     tmp_path: Path,
 ) -> None:
     raw = 'Мне близок проект "Example" — я работал с Python\'s tooling. Extra'
-    vacancy_analyzer, _ = analyzer(tmp_path, [response(raw)], max_length=55)
+    replacement = 'Мне близок "Example" и Python\'s tooling.'
+    vacancy_analyzer, adapter = analyzer(
+        tmp_path, [response(raw), response(replacement)], max_length=55
+    )
 
     letter = asyncio.run(
         vacancy_analyzer.generate_cover_letter("Developer", "Description")
     )
 
-    assert letter == raw[:55].rstrip()
+    assert letter == replacement
     assert '"Example"' in letter
     assert "Python's" in letter
+    assert len(adapter.requests) == 2
 
 
 def test_prompt_contains_only_profile_vacancy_and_cover_rules(tmp_path: Path) -> None:
@@ -231,3 +236,82 @@ def test_prompt_contains_only_profile_vacancy_and_cover_rules(tmp_path: Path) ->
         "style": "professional",
     }
     assert "test-token" not in sent.user_content
+
+
+PORTFOLIO = "https://portfolio.example/candidate"
+CLOSING = "Буду рад пообщаться 🙂"
+
+
+@pytest.mark.parametrize("raw", [
+    "Привет команде Example! 👋\n\nМой опыт — финтех и AI-прототипирование.",
+    "Финтех и AI. " * 400,
+    f"Привет команде Example!\n\nПортфолио: [{PORTFOLIO}]({PORTFOLIO})\n\n{CLOSING}",
+])
+def test_generated_letters_always_keep_full_portfolio_and_closing(tmp_path: Path, raw: str) -> None:
+    replacement = "Привет команде Example! 👋\n\nФинтех и AI."
+    vacancy_analyzer, adapter = analyzer(
+        tmp_path, [response(raw), response(replacement)], max_length=240
+    )
+    loaded = vacancy_analyzer.settings
+    vacancy_analyzer.settings = replace(loaded, profile=replace(
+        loaded.profile, cover_letter=replace(
+            loaded.profile.cover_letter, required_portfolio_url=PORTFOLIO,
+            closing=CLOSING, style="Mention fintech experience and confident use of AI.",
+        ),
+    ))
+    letter = asyncio.run(vacancy_analyzer.generate_cover_letter(
+        "Product Designer", "Design banking products", company_name="Example"
+    ))
+    assert has_required_portfolio(letter, PORTFOLIO)
+    assert letter.count(PORTFOLIO) == 1
+    assert len(letter) <= 240
+    assert letter.endswith(CLOSING)
+    payload = json.loads(adapter.requests[0].user_content)
+    assert payload["vacancy"]["company_name"] == "Example"
+    assert payload["cover_letter"]["required_portfolio_url"] == PORTFOLIO
+    assert "fintech" in payload["cover_letter"]["style"]
+
+
+def test_markdown_separators_and_standalone_dots_are_removed(tmp_path: Path) -> None:
+    raw = (
+        "Привет команде Example! 👋\n\n---\n\n"
+        "Откликаюсь на позицию продуктового дизайнера.\n\n.\n\n---\n\n"
+        "У меня сильный финтех-опыт и уверенное владение AI."
+    )
+    vacancy_analyzer, _ = analyzer(tmp_path, [response(raw)], max_length=500)
+    loaded = vacancy_analyzer.settings
+    vacancy_analyzer.settings = replace(loaded, profile=replace(
+        loaded.profile, cover_letter=replace(
+            loaded.profile.cover_letter, required_portfolio_url=PORTFOLIO,
+            closing=CLOSING,
+        ),
+    ))
+
+    letter = asyncio.run(vacancy_analyzer.generate_cover_letter(
+        "Product Designer", "Design a product", company_name="Example"
+    ))
+
+    assert "\n---\n" not in letter
+    assert "\n.\n" not in letter
+    assert cover_letter_validation_error(letter, PORTFOLIO, CLOSING, 500) == ""
+
+
+def test_two_oversized_drafts_are_rejected_without_character_truncation(
+    tmp_path: Path,
+) -> None:
+    raw = "Полное предложение. " * 100
+    vacancy_analyzer, adapter = analyzer(
+        tmp_path, [response(raw), response(raw)], max_length=120
+    )
+
+    letter = asyncio.run(
+        vacancy_analyzer.generate_cover_letter("Designer", "Description")
+    )
+
+    assert letter == ""
+    assert len(adapter.requests) == 2
+
+
+@pytest.mark.parametrize("url", [PORTFOLIO + "-wrong", PORTFOLIO + "?redirect=other", PORTFOLIO + "/other", "invalid" + PORTFOLIO])
+def test_similar_url_does_not_satisfy_required_portfolio(url: str) -> None:
+    assert not has_required_portfolio(f"Портфолио: {url}", PORTFOLIO)

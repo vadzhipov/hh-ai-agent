@@ -42,6 +42,9 @@ class FakeLocator:
     async def fill(self, value: str) -> None:
         self.filled = value
 
+    async def input_value(self) -> str:
+        return self.filled
+
     async def count(self) -> int:
         return int(self.visible)
 
@@ -64,6 +67,8 @@ class FakeApplicationPage:
         self.clicks: list[str] = []
         self.selectors: list[str] = []
         self.closed = False
+        self.textarea = FakeLocator(True)
+        self.frames = [ConfirmedChatFrame()]
 
     async def goto(self, url: str, **kwargs) -> None:
         if self.fail_navigation:
@@ -71,6 +76,8 @@ class FakeApplicationPage:
 
     def locator(self, selector: str) -> FakeLocator:
         self.selectors.append(selector)
+        if selector == 'button[data-qa="vacancy-response-link-view-topic"]':
+            return FakeLocator(True, self.clicks, "open_chat")
         if selector == '[data-qa="vacancy-description"]':
             return FakeLocator(True)
         if selector == 'textarea[name^="task_"]':
@@ -86,7 +93,7 @@ class FakeApplicationPage:
         if "letter-toggle" in selector or "сопроводительное" in selector:
             return FakeLocator(False)
         if selector in {"textarea", 'textarea:not([name^="task_"])'}:
-            return FakeLocator(True)
+            return self.textarea
         if "vacancy-response-submit" in selector:
             return FakeLocator(True, self.clicks, "final_submit")
         return FakeLocator(False)
@@ -108,6 +115,19 @@ class FakeApplicationContext:
         return self.page
 
 
+class ConfirmedChatBody:
+    async def inner_text(self) -> str:
+        return PORTFOLIO
+
+
+class ConfirmedChatFrame:
+    url = "https://chatik.hh.ru/chat/confirmed"
+
+    def locator(self, selector: str) -> ConfirmedChatBody:
+        assert selector == "body"
+        return ConfirmedChatBody()
+
+
 class FailingApplicationContext:
     async def new_page(self):
         raise RuntimeError("browser page creation failed")
@@ -115,6 +135,17 @@ class FailingApplicationContext:
 
 async def no_sleep(_: float) -> None:
     return None
+
+
+PORTFOLIO = "https://portfolio.example/candidate"
+
+
+def require_portfolio(app_settings):
+    return replace(app_settings, profile=replace(
+        app_settings.profile, cover_letter=replace(
+            app_settings.profile.cover_letter, required_portfolio_url=PORTFOLIO
+        ),
+    ))
 
 
 def settings(tmp_path: Path, **environment: str):
@@ -125,7 +156,12 @@ def settings(tmp_path: Path, **environment: str):
     return replace(loaded, database_path=tmp_path / "agent.db")
 
 
-def pending(database: Database, job_id: str = "job-1", letter: str = "Letter") -> None:
+def pending(
+    database: Database,
+    job_id: str = "job-1",
+    letter: str = "Letter",
+    confidence: float = 0.9,
+) -> None:
     assert database.discover(
         job_id=job_id,
         title="Python developer",
@@ -140,7 +176,7 @@ def pending(database: Database, job_id: str = "job-1", letter: str = "Letter") -
         cover_letter=letter,
         llm_decision=True,
         llm_reason="Relevant",
-        confidence=0.9,
+        confidence=confidence,
         now=NOW,
     )
 
@@ -337,7 +373,13 @@ def test_employer_questionnaire_blocks_submit(tmp_path: Path) -> None:
 
     assert not sent
     assert page.clicks == ["open_response"]
-    assert database.get("job-1").status is VacancyStatus.APPLY_FAILED
+    vacancy = database.get("job-1")
+    assert vacancy.status is VacancyStatus.APPLY_FAILED
+    assert vacancy.error_text == "questionnaire_required"
+    assert vacancy.submit_attempted_at is None
+    assert database.available_application_slots(
+        daily_limit=5, now=NOW + timedelta(minutes=4)
+    ) == 5
 
 
 def test_success_marker_without_hh_confirmation_fails_closed(tmp_path: Path) -> None:
@@ -368,7 +410,7 @@ def test_success_marker_without_hh_confirmation_fails_closed(tmp_path: Path) -> 
     assert database.get("job-1").status is VacancyStatus.APPLY_FAILED
 
 
-def test_permission_is_rechecked_for_expiry_immediately_before_submit(
+def test_permission_is_rechecked_before_first_response_action(
     tmp_path: Path,
 ) -> None:
     app_settings = settings(
@@ -394,7 +436,7 @@ def test_permission_is_rechecked_for_expiry_immediately_before_submit(
     )
 
     assert not sent
-    assert page.clicks == ["open_response"]
+    assert page.clicks == []
     assert database.get("job-1").status is VacancyStatus.EXPIRED
 
 
@@ -419,3 +461,169 @@ def test_action_delay_never_drops_below_configured_minimum(tmp_path: Path) -> No
 
     assert len(delays) == 1
     assert delays[0] >= app_settings.min_seconds_between_actions
+
+
+def test_missing_portfolio_blocks_approval_without_touching_browser(tmp_path: Path) -> None:
+    app_settings = require_portfolio(settings(tmp_path, APP_MODE="approval", ENABLE_REAL_APPLY="true", TG_USER_ID="42"))
+    database = Database(app_settings.database_path)
+    database.init()
+    pending(database, letter="Letter without portfolio")
+    client = HHClient(NeverPageContext(), app_settings, database, ApprovalGuard(app_settings, database))
+    service = ApprovalService(app_settings, database, client, now_factory=lambda: NOW + timedelta(minutes=1))
+
+    result = asyncio.run(service.approve_and_apply("job-1", 42))
+
+    assert not result.ok
+    assert "портфолио" in result.message
+    assert database.get("job-1").status is VacancyStatus.PENDING_APPROVAL
+
+
+def test_auto_apply_reuses_the_guarded_submission_path(tmp_path: Path) -> None:
+    app_settings = settings(
+        tmp_path,
+        APP_MODE="approval",
+        ENABLE_REAL_APPLY="true",
+        TG_USER_ID="42",
+        AUTO_APPLY_ENABLED="true",
+        MAX_APPLICATIONS_PER_DAY="20",
+    )
+    database = Database(app_settings.database_path)
+    database.init()
+    pending(database, confidence=0.91)
+    page = FakeApplicationPage()
+    client = HHClient(
+        FakeApplicationContext(page),
+        app_settings,
+        database,
+        ApprovalGuard(app_settings, database, now_factory=lambda: NOW + timedelta(minutes=2)),
+        sleep=no_sleep,
+        now_factory=lambda: NOW + timedelta(minutes=3),
+    )
+    service = ApprovalService(
+        app_settings, database, client, now_factory=lambda: NOW + timedelta(minutes=1)
+    )
+
+    result = asyncio.run(service.auto_apply("job-1"))
+
+    assert result.ok
+    assert page.clicks == ["open_response", "final_submit"]
+    assert database.get("job-1").status is VacancyStatus.APPLIED
+
+
+def test_auto_apply_keeps_low_confidence_vacancy_pending(tmp_path: Path) -> None:
+    app_settings = settings(
+        tmp_path,
+        APP_MODE="approval",
+        ENABLE_REAL_APPLY="true",
+        TG_USER_ID="42",
+        AUTO_APPLY_ENABLED="true",
+        MAX_APPLICATIONS_PER_DAY="20",
+    )
+    database = Database(app_settings.database_path)
+    database.init()
+    pending(database, confidence=0.84)
+    service = ApprovalService(
+        app_settings,
+        database,
+        HHClient(
+            NeverPageContext(), app_settings, database, ApprovalGuard(app_settings, database)
+        ),
+    )
+
+    result = asyncio.run(service.auto_apply("job-1"))
+
+    assert not result.ok
+    assert database.get("job-1").status is VacancyStatus.PENDING_APPROVAL
+
+
+def test_low_level_send_also_rejects_missing_portfolio(tmp_path: Path) -> None:
+    app_settings = require_portfolio(settings(tmp_path, APP_MODE="approval", ENABLE_REAL_APPLY="true", TG_USER_ID="42"))
+    database = Database(app_settings.database_path)
+    database.init()
+    pending(database, letter="Letter without portfolio")
+    token = database.approve("job-1", 42, 42, NOW + timedelta(minutes=1))
+    client = HHClient(NeverPageContext(), app_settings, database,
+                      ApprovalGuard(app_settings, database, now_factory=lambda: NOW + timedelta(minutes=2)),
+                      now_factory=lambda: NOW + timedelta(minutes=3))
+
+    assert not asyncio.run(client.submit_application(ApplicationPermission("job-1", token, 42)))
+    assert database.get("job-1").error_text == "required_portfolio_missing"
+
+
+@pytest.mark.parametrize(
+    ("letter", "expected_error"),
+    [
+        (
+            f"Complete sentence.\n\n.\n\nПортфолио: {PORTFOLIO}",
+            "cover_letter_layout_artifact",
+        ),
+        (
+            f"Incomplete sentence\n\nПортфолио: {PORTFOLIO}",
+            "cover_letter_incomplete",
+        ),
+    ],
+)
+def test_low_level_send_rejects_malformed_cover_letter_before_browser(
+    tmp_path: Path, letter: str, expected_error: str
+) -> None:
+    app_settings = require_portfolio(
+        settings(
+            tmp_path,
+            APP_MODE="approval",
+            ENABLE_REAL_APPLY="true",
+            TG_USER_ID="42",
+        )
+    )
+    database = Database(app_settings.database_path)
+    database.init()
+    pending(database, letter=letter)
+    token = database.approve("job-1", 42, 42, NOW + timedelta(minutes=1))
+    client = HHClient(
+        NeverPageContext(),
+        app_settings,
+        database,
+        ApprovalGuard(
+            app_settings,
+            database,
+            now_factory=lambda: NOW + timedelta(minutes=2),
+        ),
+        now_factory=lambda: NOW + timedelta(minutes=3),
+    )
+
+    assert not asyncio.run(
+        client.submit_application(ApplicationPermission("job-1", token, 42))
+    )
+    assert database.get("job-1").error_text == expected_error
+
+
+@pytest.mark.parametrize("field_state", ["missing", "fill_failed", "discarded", "correct"])
+def test_required_portfolio_must_reach_hh_textarea(tmp_path: Path, field_state: str) -> None:
+    app_settings = require_portfolio(settings(tmp_path, APP_MODE="approval", ENABLE_REAL_APPLY="true", TG_USER_ID="42"))
+    database = Database(app_settings.database_path)
+    database.init()
+    letter = f"Привет команде Example!\n\nФинтех и AI.\n\nПортфолио: {PORTFOLIO}"
+    pending(database, letter=letter)
+    page = FakeApplicationPage()
+    if field_state == "missing":
+        page.textarea.visible = False
+    elif field_state == "fill_failed":
+        async def fail_fill(value):
+            raise RuntimeError("fill failed")
+        page.textarea.fill = fail_fill
+    elif field_state == "discarded":
+        async def discard_fill(value):
+            page.textarea.filled = "Text cleared by the page"
+        page.textarea.fill = discard_fill
+    client = HHClient(FakeApplicationContext(page), app_settings, database,
+                      ApprovalGuard(app_settings, database, now_factory=lambda: NOW + timedelta(minutes=2)),
+                      sleep=no_sleep, now_factory=lambda: NOW + timedelta(minutes=3))
+    service = ApprovalService(app_settings, database, client, now_factory=lambda: NOW + timedelta(minutes=1))
+
+    result = asyncio.run(service.approve_and_apply("job-1", 42))
+
+    assert result.ok is (field_state == "correct")
+    assert ("final_submit" in page.clicks) is (field_state == "correct")
+    if field_state == "correct":
+        assert page.textarea.filled == letter
+    else:
+        assert database.get("job-1").status is VacancyStatus.APPLY_FAILED

@@ -81,7 +81,7 @@ class ManagedLLMProvider:
                 raise LLMDailyLimitError()
             try:
                 response = await self.adapter.complete(active_request)
-                if not response.text.strip():
+                if not response.text.strip() or response.finish_reason == "length":
                     raise LLMInvalidResponseError()
                 parsed = None
                 if response_model is not None:

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 from dotenv import dotenv_values
@@ -35,6 +36,8 @@ class CandidateProfile:
     work_format: tuple[str, ...]
     excluded_positions: tuple[str, ...]
     additional_information: str
+    excluded_companies: tuple[str, ...] = ()
+    excluded_keywords: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -43,6 +46,7 @@ class HHProfile:
     search_queries: tuple[str, ...]
     areas: tuple[str, ...]
     experience_filters: tuple[str, ...]
+    remote_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -50,6 +54,8 @@ class CoverLetterProfile:
     language: str
     max_length: int
     style: str
+    required_portfolio_url: str = ""
+    closing: str = ""
 
 
 @dataclass(frozen=True)
@@ -75,6 +81,20 @@ class LLMSettings:
     openai_compatible_base_url: str
     openai_compatible_api_key: str
     openai_compatible_json_mode: bool
+    openai_compatible_reasoning_enabled: bool | None = None
+
+
+@dataclass(frozen=True)
+class AutoApplySettings:
+    enabled: bool
+    min_confidence: float
+    min_batch_size: int
+    max_batch_size: int
+    min_interval_hours: int
+    max_interval_hours: int
+    start_hour: int
+    end_hour: int
+    timezone: str
 
 
 @dataclass(frozen=True)
@@ -95,6 +115,7 @@ class Settings:
     max_pages_per_query: int
     min_seconds_between_actions: int
     approval_ttl_minutes: int
+    auto_apply: AutoApplySettings
     captcha_timeout_seconds: int
     captcha_max_attempts: int
     circuit_breaker_min_sample: int
@@ -192,6 +213,18 @@ def load_settings(
             return 0
         return parsed
 
+    def hour(key: str, default: str) -> int:
+        value = values.get(key, default).strip()
+        try:
+            parsed = int(value)
+        except ValueError:
+            errors.append(f"{key} must be an integer hour between 0 and 23")
+            return 0
+        if not 0 <= parsed <= 23:
+            errors.append(f"{key} must be an integer hour between 0 and 23")
+            return 0
+        return parsed
+
     def number(key: str, default: str) -> float:
         value = values.get(key, default).strip()
         try:
@@ -245,6 +278,41 @@ def load_settings(
     app_mode = values.get("APP_MODE", "dry_run").strip().lower()
     if app_mode not in {"dry_run", "approval"}:
         errors.append("APP_MODE must be dry_run or approval")
+    enable_real_apply = boolean("ENABLE_REAL_APPLY", "false")
+
+    auto_apply_enabled = boolean("AUTO_APPLY_ENABLED", "false")
+    auto_apply_min_confidence = ratio("AUTO_APPLY_MIN_CONFIDENCE", "0.85")
+    auto_apply_min_batch_size = positive_integer("AUTO_APPLY_MIN_BATCH_SIZE", "5")
+    auto_apply_max_batch_size = positive_integer("AUTO_APPLY_MAX_BATCH_SIZE", "6")
+    auto_apply_min_interval_hours = positive_integer(
+        "AUTO_APPLY_MIN_INTERVAL_HOURS", "3"
+    )
+    auto_apply_max_interval_hours = positive_integer(
+        "AUTO_APPLY_MAX_INTERVAL_HOURS", "5"
+    )
+    auto_apply_start_hour = hour("AUTO_APPLY_START_HOUR", "10")
+    auto_apply_end_hour = hour("AUTO_APPLY_END_HOUR", "22")
+    auto_apply_timezone = values.get("AUTO_APPLY_TIMEZONE", "UTC").strip()
+    try:
+        ZoneInfo(auto_apply_timezone)
+    except (ValueError, ZoneInfoNotFoundError):
+        errors.append("AUTO_APPLY_TIMEZONE must be an IANA timezone")
+    if auto_apply_min_batch_size > auto_apply_max_batch_size:
+        errors.append("AUTO_APPLY_MIN_BATCH_SIZE must be at most AUTO_APPLY_MAX_BATCH_SIZE")
+    if auto_apply_enabled and auto_apply_max_batch_size > positive_integer(
+        "MAX_APPLICATIONS_PER_DAY", "5"
+    ):
+        errors.append("AUTO_APPLY_MAX_BATCH_SIZE must not exceed MAX_APPLICATIONS_PER_DAY")
+    if auto_apply_min_interval_hours > auto_apply_max_interval_hours:
+        errors.append(
+            "AUTO_APPLY_MIN_INTERVAL_HOURS must be at most AUTO_APPLY_MAX_INTERVAL_HOURS"
+        )
+    if auto_apply_start_hour >= auto_apply_end_hour:
+        errors.append("AUTO_APPLY_START_HOUR must be before AUTO_APPLY_END_HOUR")
+    if auto_apply_enabled and app_mode != "approval":
+        errors.append("AUTO_APPLY_ENABLED requires APP_MODE=approval")
+    if auto_apply_enabled and not enable_real_apply:
+        errors.append("AUTO_APPLY_ENABLED requires ENABLE_REAL_APPLY=true")
 
     browser_backend = values.get("BROWSER_BACKEND", "cloakbrowser").strip().lower()
     if browser_backend not in {"cloakbrowser", "playwright"}:
@@ -315,6 +383,10 @@ def load_settings(
     candidate_data = section("candidate")
     hh_data = section("hh")
     cover_data = section("cover_letter")
+    remote_only_value = hh_data.get("remote_only", False)
+    if not isinstance(remote_only_value, bool):
+        errors.append("hh.remote_only must be true or false")
+        remote_only_value = False
 
     try:
         candidate = CandidateProfile(
@@ -330,12 +402,15 @@ def load_settings(
             work_format=_strings(candidate_data, "work_format"),
             excluded_positions=_strings(candidate_data, "excluded_positions"),
             additional_information=_text(candidate_data, "additional_information"),
+            excluded_companies=_strings(candidate_data, "excluded_companies"),
+            excluded_keywords=_strings(candidate_data, "excluded_keywords"),
         )
         hh = HHProfile(
             resume_name=_text(hh_data, "resume_name"),
             search_queries=_strings(hh_data, "search_queries"),
             areas=_strings(hh_data, "areas"),
             experience_filters=_strings(hh_data, "experience_filters"),
+            remote_only=remote_only_value,
         )
         max_length_value = cover_data.get("max_length", 1800)
         if isinstance(max_length_value, bool) or not isinstance(max_length_value, int) or max_length_value <= 0:
@@ -345,7 +420,26 @@ def load_settings(
             language=_text(cover_data, "language", "ru"),
             max_length=max_length_value,
             style=_text(cover_data, "style", "professional"),
+            required_portfolio_url=_text(cover_data, "required_portfolio_url"),
+            closing=_text(cover_data, "closing"),
         )
+        if cover_letter.required_portfolio_url:
+            validate_endpoint(
+                "cover_letter.required_portfolio_url",
+                cover_letter.required_portfolio_url,
+                https_only=True,
+            )
+        if cover_letter.required_portfolio_url or cover_letter.closing:
+            footer_parts = []
+            if cover_letter.required_portfolio_url:
+                footer_parts.append(
+                    f"Портфолио: {cover_letter.required_portfolio_url}"
+                )
+            if cover_letter.closing:
+                footer_parts.append(cover_letter.closing)
+            footer = "\n\n" + "\n\n".join(footer_parts)
+            if len(footer) >= cover_letter.max_length:
+                errors.append("cover_letter.max_length must leave room for the required portfolio and letter")
     except TypeError as exc:
         errors.append(str(exc))
         candidate = CandidateProfile("", "", (), "", "", (), (), "", "", (), (), "")
@@ -383,9 +477,14 @@ def load_settings(
             openai_compatible_json_mode=boolean(
                 "OPENAI_COMPATIBLE_JSON_MODE", "true"
             ),
+            openai_compatible_reasoning_enabled=(
+                boolean("OPENAI_COMPATIBLE_REASONING_ENABLED", "false")
+                if values.get("OPENAI_COMPATIBLE_REASONING_ENABLED", "").strip()
+                else None
+            ),
         ),
         app_mode=app_mode,
-        enable_real_apply=boolean("ENABLE_REAL_APPLY", "false"),
+        enable_real_apply=enable_real_apply,
         browser_backend=browser_backend,
         browser_headless=boolean("BROWSER_HEADLESS", "false"),
         browser_profile_dir=_path(values.get("BROWSER_PROFILE_DIR", ".browser-profile")),
@@ -397,6 +496,17 @@ def load_settings(
         max_pages_per_query=positive_integer("MAX_PAGES_PER_QUERY", "2"),
         min_seconds_between_actions=positive_integer("MIN_SECONDS_BETWEEN_ACTIONS", "5"),
         approval_ttl_minutes=positive_integer("APPROVAL_TTL_MINUTES", "30"),
+        auto_apply=AutoApplySettings(
+            enabled=auto_apply_enabled,
+            min_confidence=auto_apply_min_confidence,
+            min_batch_size=auto_apply_min_batch_size,
+            max_batch_size=auto_apply_max_batch_size,
+            min_interval_hours=auto_apply_min_interval_hours,
+            max_interval_hours=auto_apply_max_interval_hours,
+            start_hour=auto_apply_start_hour,
+            end_hour=auto_apply_end_hour,
+            timezone=auto_apply_timezone,
+        ),
         captcha_timeout_seconds=positive_integer("CAPTCHA_TIMEOUT_SECONDS", "120"),
         captcha_max_attempts=positive_integer("CAPTCHA_MAX_ATTEMPTS", "2"),
         circuit_breaker_min_sample=positive_integer(

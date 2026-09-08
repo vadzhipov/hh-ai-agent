@@ -4,13 +4,15 @@ import sys
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
 import main as main_module
 from ai_analyzer import AnalysisError, SuitabilityResult, VacancyAnalyzer
+from approval import ApprovalResult
 from config import load_settings
-from database import Database, VacancyStatus
+from database import Database, SearchRun, VacancyStatus
 from hh_client import (
     CompanyDetails,
     PageState,
@@ -26,7 +28,11 @@ from main import (
     VacancyProcessResult,
     SearchRunStats,
     agent_loop,
+    format_auto_batch_report,
+    next_auto_batch_at,
+    next_auto_window_start_after,
     process_vacancy,
+    restored_auto_batch_at,
     run_search_cycle,
 )
 from tests.test_config import VALID_ENV, write_profile
@@ -55,7 +61,7 @@ class FakeHHClient:
         self.read_calls += 1
         return self.details
 
-    async def search_vacancies(self, query, areas, experience_filters):
+    async def search_vacancies(self, query, areas, experience_filters, *, remote_only=False):
         self.search_calls += 1
         return (
             self.search_results.pop(0)
@@ -75,7 +81,7 @@ class SearchReached(Exception):
 
 
 class StopAtSearchHHClient(FakeHHClient):
-    async def search_vacancies(self, *_args):
+    async def search_vacancies(self, *_args, **_kwargs):
         raise SearchReached
 
 
@@ -92,7 +98,9 @@ class FakeAnalyzer:
             fit_points=[{"category": "Навыки", "text": "Python"}],
         )
 
-    async def generate_cover_letter(self, title: str, description: str) -> str:
+    async def generate_cover_letter(
+        self, title: str, description: str, company_name: str = ""
+    ) -> str:
         return "Safe local-profile letter"
 
 
@@ -137,12 +145,42 @@ class FakeTelegram:
         return None
 
 
+class FakeAutoApprovalService:
+    def __init__(self, outcome: ApprovalResult | None = None):
+        self.outcome = outcome or ApprovalResult(True, "Application sent")
+        self.calls: list[str] = []
+
+    async def auto_apply(self, job_id: str) -> ApprovalResult:
+        self.calls.append(job_id)
+        return self.outcome
+
+
 def settings(tmp_path: Path, mode: str):
     loaded = load_settings(
         profile_path=write_profile(tmp_path),
         environ={**VALID_ENV, "TG_USER_ID": "42", "APP_MODE": mode},
     )
     return replace(loaded, database_path=tmp_path / "agent.db")
+
+
+def auto_settings(tmp_path: Path):
+    loaded = settings(tmp_path, "approval")
+    return replace(
+        loaded,
+        max_applications_per_day=20,
+        auto_apply=replace(
+            loaded.auto_apply,
+            enabled=True,
+            min_confidence=0.85,
+            min_batch_size=5,
+            max_batch_size=6,
+            min_interval_hours=3,
+            max_interval_hours=5,
+            start_hour=10,
+            end_hour=22,
+            timezone="Europe/Berlin",
+        ),
+    )
 
 
 def test_run_shares_mistral_manager_and_assigns_telegram_notifier(
@@ -234,6 +272,10 @@ def test_dry_run_records_and_previews_without_pending_actions(tmp_path: Path) ->
     details = VacancyDetails(
         SUMMARY, PageState.VACANCY_LOADED, "Example", "Build Python services"
     )
+    class CompanyCheckingAnalyzer(FakeAnalyzer):
+        async def generate_cover_letter(self, title, description, company_name=""):
+            assert company_name == "Example"
+            return await super().generate_cover_letter(title, description, company_name)
 
     asyncio.run(
         process_vacancy(
@@ -241,7 +283,7 @@ def test_dry_run_records_and_previews_without_pending_actions(tmp_path: Path) ->
             app_settings,
             database,
             FakeHHClient(details),
-            FakeAnalyzer(),
+            CompanyCheckingAnalyzer(),
             telegram,
             now_factory=lambda: NOW,
         )
@@ -278,6 +320,185 @@ def test_approval_mode_records_pending_and_sends_actions(tmp_path: Path) -> None
 
     assert database.get("job-1").status is VacancyStatus.PENDING_APPROVAL
     assert telegram.previews == [("job-1", True)]
+
+
+def test_auto_apply_uses_only_high_confidence_vacancies(tmp_path: Path) -> None:
+    app_settings = auto_settings(tmp_path)
+    database = Database(app_settings.database_path)
+    database.init()
+    telegram = FakeTelegram()
+    details = VacancyDetails(
+        SUMMARY, PageState.VACANCY_LOADED, "Example", "Build Python services"
+    )
+    auto_service = FakeAutoApprovalService()
+
+    result = asyncio.run(
+        process_vacancy(
+            SUMMARY,
+            app_settings,
+            database,
+            FakeHHClient(details),
+            FakeAnalyzer(),
+            telegram,
+            approval_service=auto_service,
+            now_factory=lambda: NOW,
+        )
+    )
+
+    assert result.outcome == "auto_applied"
+    assert auto_service.calls == [SUMMARY.id]
+    assert telegram.previews == []
+    assert telegram.notifications == ["✓ Автоотклик отправлен: Python developer"]
+
+
+def test_auto_apply_keeps_lower_confidence_vacancy_for_manual_review(
+    tmp_path: Path,
+) -> None:
+    app_settings = auto_settings(tmp_path)
+    database = Database(app_settings.database_path)
+    database.init()
+    telegram = FakeTelegram()
+    details = VacancyDetails(
+        SUMMARY, PageState.VACANCY_LOADED, "Example", "Build Python services"
+    )
+    auto_service = FakeAutoApprovalService()
+    analyzer = SequenceAnalyzer(
+        [SuitabilityResult(suitable=True, confidence=0.84, reason="Relevant work")]
+    )
+
+    result = asyncio.run(
+        process_vacancy(
+            SUMMARY,
+            app_settings,
+            database,
+            FakeHHClient(details),
+            analyzer,
+            telegram,
+            approval_service=auto_service,
+            now_factory=lambda: NOW,
+        )
+    )
+
+    assert result.outcome == "telegram_card"
+    assert auto_service.calls == []
+    assert database.get(SUMMARY.id).status is VacancyStatus.PENDING_APPROVAL
+    assert telegram.previews == [(SUMMARY.id, True)]
+
+
+def test_auto_batch_stops_after_its_send_target(tmp_path: Path) -> None:
+    app_settings = auto_settings(tmp_path)
+    database = Database(app_settings.database_path)
+    database.init()
+    telegram = FakeTelegram()
+    summaries = [
+        SUMMARY,
+        VacancySummary("job-2", "Backend developer", "https://example.com/vacancy/job-2", "Python"),
+    ]
+    details = VacancyDetails(
+        SUMMARY, PageState.VACANCY_LOADED, "Example", "Build Python services"
+    )
+    auto_service = FakeAutoApprovalService()
+
+    run = asyncio.run(
+        run_search_cycle(
+            app_settings,
+            database,
+            FakeHHClient(details, [VacancySearchResult(summaries, 2, 0)]),
+            FakeAnalyzer(),
+            telegram,
+            AgentControl(),
+            approval_service=auto_service,
+            auto_apply_batch_limit=1,
+            now_factory=lambda: NOW,
+        )
+    )
+
+    assert auto_service.calls == [SUMMARY.id]
+    assert run.new_vacancies == 2
+    assert database.get("job-2") is None
+
+
+def test_auto_batch_schedule_stays_inside_configured_daytime_window(
+    tmp_path: Path,
+) -> None:
+    app_settings = auto_settings(tmp_path)
+    before_window = datetime(2026, 7, 26, 7, tzinfo=UTC)
+    late_window = datetime(2026, 7, 26, 21, tzinfo=UTC)
+
+    first = next_auto_batch_at(before_window, app_settings)
+    after_late_batch = next_auto_batch_at(
+        late_window, app_settings, interval_hours=5
+    )
+    after_limit = next_auto_window_start_after(late_window, app_settings)
+
+    local_timezone = ZoneInfo("Europe/Berlin")
+    assert first.astimezone(local_timezone).hour == 10
+    assert after_late_batch.astimezone(local_timezone).hour == 10
+    assert after_late_batch.date() > late_window.astimezone(local_timezone).date()
+    assert after_limit.astimezone(local_timezone).hour == 10
+
+
+def test_auto_schedule_restart_preserves_minimum_interval(tmp_path: Path) -> None:
+    app_settings = auto_settings(tmp_path)
+    database = Database(app_settings.database_path)
+    database.init()
+    last_batch_finished = datetime(2026, 7, 26, 5, tzinfo=UTC)
+    database.save_search_run(
+        started_at=last_batch_finished - timedelta(minutes=5),
+        finished_at=last_batch_finished,
+        state="completed",
+        query_count=1,
+        found_results=0,
+        new_vacancies=0,
+        duplicates=0,
+        rejected_by_filter=0,
+        rejected_by_llm=0,
+        telegram_cards=0,
+        error_count=0,
+        rejection_reasons={},
+        error_reasons={},
+    )
+
+    restart_at = last_batch_finished + timedelta(minutes=10)
+    next_batch = restored_auto_batch_at(
+        restart_at, app_settings, database, interval_hours=3
+    )
+
+    assert next_batch == last_batch_finished + timedelta(hours=3)
+
+
+def test_auto_batch_report_contains_result_and_next_run(tmp_path: Path) -> None:
+    app_settings = auto_settings(tmp_path)
+    run = SearchRun(
+        id=1,
+        started_at="2026-07-26T05:00:00+00:00",
+        finished_at="2026-07-26T05:10:00+00:00",
+        state="completed",
+        query_count=3,
+        found_results=60,
+        new_vacancies=12,
+        duplicates=4,
+        rejected_by_filter=5,
+        rejected_by_llm=3,
+        telegram_cards=2,
+        error_count=1,
+        rejection_reasons={},
+        error_reasons={},
+        last_safe_error="",
+        circuit_reason="",
+    )
+
+    report = format_auto_batch_report(
+        run,
+        auto_applied=4,
+        next_batch=datetime(2026, 7, 26, 8, 10, tzinfo=UTC),
+        settings=app_settings,
+    )
+
+    assert "Найдено: 60; новых: 12." in report
+    assert "Отправлено: 4; на ручную проверку: 2." in report
+    assert "Отсечено фильтрами: 8; безопасно остановлено: 1." in report
+    assert "Следующая пачка: 26.07 10:10 Europe/Berlin." in report
 
 
 def test_browser_read_error_is_persisted_as_apply_failed(tmp_path: Path) -> None:

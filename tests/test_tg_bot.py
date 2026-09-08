@@ -88,6 +88,21 @@ def add_preview_vacancy(database: Database) -> None:
     )
 
 
+def test_polling_leaves_shutdown_signals_to_application(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    telegram, _, _, bot = service(tmp_path)
+    calls = []
+
+    async def polling(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr(telegram.dispatcher, "start_polling", polling)
+    asyncio.run(telegram.start_polling())
+
+    assert calls == [((bot,), {"handle_signals": False})]
+
+
 def add_search_run(database: Database) -> None:
     database.save_search_run(
         started_at=NOW,
@@ -251,3 +266,32 @@ def test_pending_and_stats_read_sqlite(tmp_path: Path) -> None:
 
     assert "job-1" in telegram.command("pending", user_id=42)
     assert "pending_approval: 1" in telegram.command("stats", user_id=42)
+
+
+@pytest.mark.parametrize("include_portfolio", [False, True])
+def test_edit_cannot_remove_required_portfolio(tmp_path: Path, include_portfolio: bool) -> None:
+    from types import SimpleNamespace
+    telegram, database, _, bot = service(tmp_path, app_mode="approval")
+    add_preview_vacancy(database)
+    url = "https://portfolio.example/candidate"
+    telegram.settings = replace(telegram.settings, profile=replace(
+        telegram.settings.profile, cover_letter=replace(
+            telegram.settings.profile.cover_letter, required_portfolio_url=url
+        ),
+    ))
+    original = database.get("job-1").cover_letter
+    edited = "My edited letter" + (f"\n\nПортфолио: {url}" if include_portfolio else "")
+    async def answer(*args, **kwargs):
+        pass
+    callback = SimpleNamespace(from_user=SimpleNamespace(id=42), data="edit:job-1", answer=answer, message=None)
+    async def scenario():
+        task = asyncio.create_task(telegram._callback_handler(callback))
+        await asyncio.sleep(0)
+        assert telegram._edit_future is not None
+        telegram._edit_future.set_result(edited)
+        await task
+    asyncio.run(scenario())
+    assert database.get("job-1").cover_letter == (edited if include_portfolio else original)
+    if not include_portfolio:
+        assert any("не сохранено" in m["text"] for m in bot.messages)
+        assert not bot.rich_messages

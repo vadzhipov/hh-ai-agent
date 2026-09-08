@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from approval import ApplicationPermission, ApprovalGuard
 from config import Settings
+from cover_letter import cover_letter_validation_error, has_required_portfolio
 from database import Database, VacancyStatus
 
 
@@ -203,26 +204,228 @@ class HHClient:
         finally:
             await page.close()
 
+    async def _response_available(self, page: Any, url: str) -> bool:
+        await page.goto(url.split("?")[0], wait_until="domcontentloaded", timeout=30_000)
+        await page.locator('[data-qa="vacancy-description"]').wait_for(
+            state="visible", timeout=20_000
+        )
+        response_control = page.locator(
+            'a[data-qa="vacancy-response-link-top"], '
+            'button[data-qa="vacancy-response-link-top"]'
+        ).first
+        return await response_control.count() > 0
+
     async def _response_confirmed(self, page: Any, url: str) -> bool:
         try:
-            await page.goto(url.split("?")[0], wait_until="domcontentloaded", timeout=30_000)
-            await page.locator('[data-qa="vacancy-description"]').wait_for(
-                state="visible", timeout=20_000
-            )
-            response_control = page.locator(
-                'a[data-qa="vacancy-response-link-top"], '
-                'button[data-qa="vacancy-response-link-top"]'
-            ).first
-            return await response_control.count() == 0
+            return not await self._response_available(page, url)
         except Exception as exc:
             logger.warning("application_confirmation_failed error=%s", exc)
             return False
+
+    async def _confirm_relocation_warning(self, page: Any) -> bool:
+        confirmation = page.locator(
+            'button[data-qa="relocation-warning-confirm"]'
+        ).first
+        if not await confirmation.is_visible():
+            return False
+        await confirmation.click()
+        await self._delay()
+        return True
+
+    async def _attach_cover_letter_after_response(
+        self, page: Any, cover_letter: str, required_portfolio: str
+    ) -> None:
+        attach = page.locator(
+            'button[data-qa="responded-success-attach-cover-letter"]'
+        ).first
+        if not await attach.is_visible():
+            raise RuntimeError("post_submit_cover_letter_control_unavailable")
+        await attach.click()
+        await self._delay()
+
+        textarea = page.locator(
+            'textarea[data-qa="vacancy-response-popup-form-letter-input"]'
+        ).first
+        await textarea.wait_for(state="visible", timeout=5_000)
+        await textarea.fill(cover_letter)
+        await self._delay()
+        entered_letter = await textarea.input_value()
+        if entered_letter != cover_letter or not has_required_portfolio(
+            entered_letter, required_portfolio
+        ):
+            raise RuntimeError("required_cover_letter_not_preserved")
+
+        submit = page.locator(
+            'button[data-qa="vacancy-response-letter-submit"]:visible'
+        ).first
+        if not await submit.is_visible():
+            raise RuntimeError("post_submit_cover_letter_submit_unavailable")
+        await submit.click()
+        try:
+            await submit.wait_for(state="hidden", timeout=15_000)
+            await attach.wait_for(state="hidden", timeout=15_000)
+        except Exception as exc:
+            raise RuntimeError("post_submit_cover_letter_not_confirmed") from exc
+
+        if required_portfolio:
+            await self._ensure_cover_letter_in_chat(
+                page, cover_letter, required_portfolio
+            )
+
+    async def _open_chat_frame(self, page: Any) -> Any:
+        chat = page.locator(
+            'button[data-qa="vacancy-response-link-view-topic"]'
+        ).first
+        await chat.wait_for(state="visible", timeout=5_000)
+        await chat.click()
+        for _ in range(20):
+            frame = next(
+                (
+                    candidate
+                    for candidate in page.frames
+                    if candidate.url.startswith("https://chatik.hh.ru/")
+                ),
+                None,
+            )
+            if frame is not None:
+                return frame
+            await self.sleep(0.25)
+        raise RuntimeError("hh_chat_frame_unavailable")
+
+    async def _ensure_cover_letter_in_chat(
+        self, page: Any, cover_letter: str, required_portfolio: str
+    ) -> None:
+        post_statuses: list[int] = []
+        if hasattr(page, "on"):
+            def capture_response(response: Any) -> None:
+                try:
+                    if response.request.method == "POST" and "chatik.hh.ru" in response.url:
+                        post_statuses.append(response.status)
+                except Exception:
+                    return
+
+            page.on("response", capture_response)
+        frame = await self._open_chat_frame(page)
+        body = await frame.locator("body").inner_text()
+        if required_portfolio in body:
+            return
+        attach = frame.get_by_text("Добавить сопроводительное", exact=False).first
+        await attach.wait_for(state="visible", timeout=5_000)
+        await attach.click()
+        await self.sleep(0.5)
+        textarea = frame.locator('textarea[data-qa="text-input"]').first
+        await textarea.wait_for(state="visible", timeout=5_000)
+        await textarea.fill(cover_letter)
+        entered_letter = await textarea.input_value()
+        if entered_letter != cover_letter or not has_required_portfolio(
+            entered_letter, required_portfolio
+        ):
+            raise RuntimeError("required_cover_letter_not_preserved_in_chat")
+        send = frame.locator('button[data-qa="chatik-do-send-message"]').first
+        await send.wait_for(state="visible", timeout=5_000)
+        if hasattr(send, "is_enabled") and not await send.is_enabled():
+            raise RuntimeError("chat_cover_letter_send_disabled")
+        await self.sleep(0.5)
+        await send.click()
+        try:
+            await frame.wait_for_function(
+                "url => document.body.innerText.includes(url)",
+                required_portfolio,
+                timeout=15_000,
+            )
+        except Exception as exc:
+            remaining = len(await textarea.input_value())
+            if remaining == 0 and any(200 <= status < 300 for status in post_statuses):
+                await page.reload(wait_until="domcontentloaded", timeout=30_000)
+                refreshed_frame = await self._open_chat_frame(page)
+                refreshed_body = await refreshed_frame.locator("body").inner_text()
+                if required_portfolio in refreshed_body:
+                    return
+            raise RuntimeError(
+                "chat_cover_letter_not_confirmed:"
+                f"post_statuses={post_statuses}:remaining_chars={remaining}"
+            ) from exc
+
+    async def attach_existing_cover_letter(
+        self, job_id: str, *, cover_letter: str | None = None
+    ) -> bool:
+        if self.settings.app_mode != "approval" or not self.settings.enable_real_apply:
+            logger.warning("cover_letter_repair_blocked job_id=%s reason=app_mode", job_id)
+            return False
+        vacancy = self.database.get(job_id)
+        if vacancy is None or vacancy.status not in {
+            VacancyStatus.APPLY_FAILED,
+            VacancyStatus.APPLIED,
+        }:
+            logger.warning("cover_letter_repair_blocked job_id=%s reason=status", job_id)
+            return False
+        letter = cover_letter if cover_letter is not None else vacancy.cover_letter
+        cover = self.settings.profile.cover_letter
+        required_portfolio = cover.required_portfolio_url
+        validation_error = cover_letter_validation_error(
+            letter,
+            required_portfolio,
+            cover.closing,
+            cover.max_length,
+        )
+        if validation_error:
+            logger.warning(
+                "cover_letter_repair_blocked job_id=%s reason=%s",
+                job_id,
+                validation_error,
+            )
+            return False
+
+        page = None
+        try:
+            page = await self.context.new_page()
+            await page.goto(vacancy.url, wait_until="domcontentloaded", timeout=30_000)
+            attach = page.locator(
+                'button[data-qa="responded-success-attach-cover-letter"]'
+            ).first
+            if await attach.is_visible():
+                await self._attach_cover_letter_after_response(
+                    page, letter, required_portfolio
+                )
+            else:
+                await self._ensure_cover_letter_in_chat(
+                    page, letter, required_portfolio
+                )
+            if vacancy.status is VacancyStatus.APPLY_FAILED:
+                updated = self.database.complete_existing_response_repair(
+                    job_id,
+                    now=self.now_factory(),
+                    cover_letter=letter,
+                )
+            else:
+                updated = self.database.record_applied_cover_letter_repair(
+                    job_id, letter
+                )
+            if not updated:
+                raise RuntimeError("cover_letter_repair_status_not_updated")
+            logger.info("cover_letter_repair_sent job_id=%s", job_id)
+            return True
+        except Exception as exc:
+            logger.error("cover_letter_repair_failed job_id=%s error=%s", job_id, exc)
+            return False
+        finally:
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception as exc:
+                    logger.warning(
+                        "cover_letter_repair_page_close_failed job_id=%s error=%s",
+                        job_id,
+                        exc,
+                    )
 
     async def search_vacancies(
         self,
         query: str,
         areas: tuple[str, ...],
         experience_filters: tuple[str, ...],
+        *,
+        remote_only: bool = False,
     ) -> VacancySearchResult:
         results: list[VacancySummary] = []
         found_results = 0
@@ -241,6 +444,8 @@ class HHClient:
                     params["area"] = list(areas)
                 if experience_filters:
                     params["experience"] = list(experience_filters)
+                if remote_only:
+                    params["schedule"] = "remote"
                 await self._delay()
                 await page.goto(
                     f"https://hh.ru/search/vacancy?{urlencode(params, doseq=True)}",
@@ -430,6 +635,16 @@ class HHClient:
         vacancy = claim.vacancy
         page = None
         try:
+            cover = self.settings.profile.cover_letter
+            required_portfolio = cover.required_portfolio_url
+            validation_error = cover_letter_validation_error(
+                vacancy.cover_letter,
+                required_portfolio,
+                cover.closing,
+                cover.max_length,
+            )
+            if validation_error:
+                raise RuntimeError(validation_error)
             page = await self.context.new_page()
             await self._delay()
             await page.goto(vacancy.url, wait_until="domcontentloaded", timeout=30_000)
@@ -443,8 +658,45 @@ class HHClient:
             ).first
             if not await response_button.is_visible():
                 raise RuntimeError("application response control was not found")
+            if not self.database.mark_submit_attempt(
+                permission.job_id,
+                permission.permit,
+                now=self.now_factory(),
+                daily_limit=self.settings.max_applications_per_day,
+            ):
+                error = "application permission failed pre-response validation"
+                self.database.complete_application(
+                    permission.job_id,
+                    permission.permit,
+                    success=False,
+                    now=self.now_factory(),
+                    error_text=error,
+                )
+                logger.warning(
+                    "application_blocked job_id=%s reason=pre_response_recheck",
+                    permission.job_id,
+                )
+                return False
             await response_button.click()
             await self._delay()
+            await self._confirm_relocation_warning(page)
+
+            post_submit_attach = page.locator(
+                'button[data-qa="responded-success-attach-cover-letter"]'
+            ).first
+            if await post_submit_attach.is_visible():
+                await self._attach_cover_letter_after_response(
+                    page, vacancy.cover_letter, required_portfolio
+                )
+                if not self.database.complete_application(
+                    permission.job_id,
+                    permission.permit,
+                    success=True,
+                    now=self.now_factory(),
+                ):
+                    raise RuntimeError("application status could not be completed")
+                logger.info("application_sent job_id=%s", permission.job_id)
+                return True
 
             resume_name = self.settings.profile.hh.resume_name
             resume_selector = page.locator(
@@ -475,7 +727,9 @@ class HHClient:
                 await textarea.wait_for(state="visible", timeout=5_000)
                 await textarea.fill(vacancy.cover_letter)
                 await self._delay()
-            except Exception:
+            except Exception as exc:
+                if required_portfolio:
+                    raise RuntimeError("required_cover_letter_field_unavailable") from exc
                 logger.info("cover_letter_field_not_found job_id=%s, proceeding to submit", vacancy.id)
 
             submit_button = page.locator(
@@ -483,25 +737,12 @@ class HHClient:
             ).first
             if not await submit_button.is_visible():
                 raise RuntimeError("final application button was not found")
-            if not self.database.mark_submit_attempt(
-                permission.job_id,
-                permission.permit,
-                now=self.now_factory(),
-                daily_limit=self.settings.max_applications_per_day,
-            ):
-                error = "application permission failed final pre-submit validation"
-                self.database.complete_application(
-                    permission.job_id,
-                    permission.permit,
-                    success=False,
-                    now=self.now_factory(),
-                    error_text=error,
-                )
-                logger.warning(
-                    "application_blocked job_id=%s reason=pre_submit_recheck",
-                    permission.job_id,
-                )
-                return False
+            if required_portfolio:
+                entered_letter = await textarea.input_value()
+                if entered_letter != vacancy.cover_letter or not has_required_portfolio(
+                    entered_letter, required_portfolio
+                ):
+                    raise RuntimeError("required_cover_letter_not_preserved")
             await submit_button.click()
             success_marker = (
                 page.locator(
@@ -514,6 +755,10 @@ class HHClient:
             await success_marker.wait_for(state="visible", timeout=5_000)
             if not await self._response_confirmed(page, vacancy.url):
                 raise RuntimeError("HH.ru did not confirm the application")
+            if required_portfolio:
+                await self._ensure_cover_letter_in_chat(
+                    page, vacancy.cover_letter, required_portfolio
+                )
             if not self.database.complete_application(
                 permission.job_id,
                 permission.permit,
@@ -523,6 +768,34 @@ class HHClient:
                 raise RuntimeError("application status could not be completed")
             logger.info("application_sent job_id=%s", permission.job_id)
             return True
+        except QuestionnaireRequiredError as exc:
+            response_still_available = False
+            if page is not None:
+                try:
+                    response_still_available = await self._response_available(
+                        page, vacancy.url
+                    )
+                except Exception as verification_error:
+                    logger.warning(
+                        "questionnaire_response_check_failed job_id=%s error=%s",
+                        permission.job_id,
+                        verification_error,
+                    )
+            self.database.complete_application(
+                permission.job_id,
+                permission.permit,
+                success=False,
+                now=self.now_factory(),
+                error_text=str(exc),
+            )
+            if response_still_available:
+                self.database.clear_verified_unsubmitted_attempt(permission.job_id)
+            logger.info(
+                "application_skipped job_id=%s reason=questionnaire_required response_available=%s",
+                permission.job_id,
+                response_still_available,
+            )
+            return False
         except Exception as exc:
             self.database.complete_application(
                 permission.job_id,
