@@ -78,6 +78,7 @@ def test_load_settings_uses_safe_defaults(tmp_path: Path) -> None:
     assert settings.circuit_breaker_unknown_ratio == 0.8
     assert settings.circuit_breaker_page_errors == 3
     assert settings.auto_apply.enabled is False
+    assert settings.auto_apply.questionnaires_enabled is False
     assert settings.auto_apply.min_confidence == 0.85
     assert settings.auto_apply.timezone == "UTC"
 
@@ -91,6 +92,7 @@ def test_auto_apply_settings_require_live_approval_and_valid_window(
         "ENABLE_REAL_APPLY": "true",
         "MAX_APPLICATIONS_PER_DAY": "20",
         "AUTO_APPLY_ENABLED": "true",
+        "AUTO_APPLY_QUESTIONNAIRES": "true",
         "AUTO_APPLY_MIN_CONFIDENCE": "0.85",
         "AUTO_APPLY_MIN_BATCH_SIZE": "5",
         "AUTO_APPLY_MAX_BATCH_SIZE": "6",
@@ -104,6 +106,7 @@ def test_auto_apply_settings_require_live_approval_and_valid_window(
     settings = load_settings(profile_path=write_profile(tmp_path), environ=enabled)
 
     assert settings.auto_apply.enabled is True
+    assert settings.auto_apply.questionnaires_enabled is True
     assert settings.auto_apply.min_batch_size == 5
     assert settings.auto_apply.max_batch_size == 6
     assert settings.auto_apply.min_interval_hours == 3

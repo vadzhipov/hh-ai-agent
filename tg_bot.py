@@ -273,8 +273,11 @@ class TelegramService:
                 if callback.message:
                     await callback.message.edit_reply_markup(reply_markup=None)
             else:
-                if vacancy and vacancy.error_text == "questionnaire_required":
-                    await self.notify_questionnaire_required(vacancy.title, vacancy.url)
+                if vacancy and vacancy.error_text.startswith("questionnaire_required"):
+                    details = vacancy.error_text.partition(":")[2]
+                    await self.notify_questionnaire_required(
+                        vacancy.title, vacancy.url, details
+                    )
                     if callback.message:
                         await callback.message.edit_reply_markup(reply_markup=None)
                 else:
@@ -720,12 +723,20 @@ class TelegramService:
         except Exception as exc:
             logger.warning("notify_analysis_failed_error error=%s", exc)
 
-    async def notify_questionnaire_required(self, title: str, url: str) -> None:
+    async def notify_questionnaire_required(
+        self, title: str, url: str, questions: str = ""
+    ) -> None:
+        question_text = (
+            f"\n\n<b>Нужен ваш ответ:</b> {html.escape(questions)}"
+            if questions
+            else ""
+        )
         text = (
             f"📋 <b>Требуется ручной отклик (тестовое / анкета)</b>\n"
             f"<b>{html.escape(title)}</b>\n"
             f"<a href=\"{html.escape(url, quote=True)}\">Открыть вакансию на HH.ru</a>\n\n"
-            f"Работодатель требует заполнении анкеты или выполнение тестового задания."
+            f"Работодатель требует заполнения анкеты или выполнения тестового задания."
+            f"{question_text}"
         )
         try:
             await self.bot.send_message(

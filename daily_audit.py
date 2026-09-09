@@ -114,7 +114,7 @@ def build_report(
             WHERE status = 'apply_failed'
               AND COALESCE(submit_attempted_at, applying_at, discovered_at) >= ?
               AND COALESCE(submit_attempted_at, applying_at, discovered_at) < ?
-              AND error_text != 'questionnaire_required'
+              AND error_text NOT LIKE 'questionnaire_required%'
             """,
             (start, end),
         ).fetchone()[0]
@@ -124,7 +124,7 @@ def build_report(
             WHERE status = 'apply_failed'
               AND COALESCE(submit_attempted_at, applying_at, discovered_at) >= ?
               AND COALESCE(submit_attempted_at, applying_at, discovered_at) < ?
-              AND error_text = 'questionnaire_required'
+              AND error_text LIKE 'questionnaire_required%'
             """,
             (start, end),
         ).fetchone()[0]

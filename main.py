@@ -171,7 +171,7 @@ def format_auto_batch_report(
         (
             "Отсечено фильтрами: "
             f"{run.rejected_by_filter + run.rejected_by_llm}; "
-            f"безопасно остановлено: {run.error_count}."
+            f"пропущено без отправки: {run.error_count}."
         ),
     ]
     if next_batch is None:
@@ -360,6 +360,27 @@ async def process_vacancy(
             except TelegramAPIError:
                 logger.warning("auto_application_notification_failed job_id=%s", summary.id)
             return VacancyProcessResult("auto_applied", page_state=PageState.VACANCY_LOADED)
+        if vacancy and vacancy.status is VacancyStatus.REJECTED_BY_FILTER:
+            reason = vacancy.llm_reason.removeprefix(
+                "Excluded by questionnaire filter: "
+            )
+            try:
+                await telegram.notify(
+                    f"↷ Вакансия пропущена по ответу в анкете: {vacancy.title}. {reason}"
+                )
+            except TelegramAPIError:
+                logger.warning("auto_application_notification_failed job_id=%s", summary.id)
+            return VacancyProcessResult(
+                "rejected_by_filter", reason, PageState.VACANCY_LOADED
+            )
+        if vacancy and vacancy.error_text.startswith("questionnaire_required"):
+            details = vacancy.error_text.partition(":")[2]
+            await telegram.notify_questionnaire_required(
+                vacancy.title, vacancy.url, details
+            )
+            return VacancyProcessResult(
+                "telegram_card", "questionnaire_required", PageState.VACANCY_LOADED
+            )
         try:
             await telegram.notify(
                 f"✗ Автоотклик не отправлен: {vacancy.title if vacancy else summary.title}. "
@@ -440,6 +461,8 @@ async def run_search_cycle(
             control.circuit_reason = circuit_reason
 
     try:
+        if settings.auto_apply.questionnaires_enabled:
+            database.requeue_legacy_questionnaire_failures()
         database.expire_approved(now())
         database.requeue_due_analysis_failures(
             now(), max_attempts=ANALYSIS_MAX_ATTEMPTS

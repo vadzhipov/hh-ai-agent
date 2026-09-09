@@ -497,7 +497,7 @@ def test_auto_batch_report_contains_result_and_next_run(tmp_path: Path) -> None:
 
     assert "Найдено: 60; новых: 12." in report
     assert "Отправлено: 4; на ручную проверку: 2." in report
-    assert "Отсечено фильтрами: 8; безопасно остановлено: 1." in report
+    assert "Отсечено фильтрами: 8; пропущено без отправки: 1." in report
     assert "Следующая пачка: 26.07 10:10 Europe/Berlin." in report
 
 

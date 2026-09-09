@@ -796,6 +796,29 @@ class Database:
             )
             return cursor.rowcount == 1
 
+    def reject_during_application(
+        self, job_id: str, permit: str, *, reason: str
+    ) -> bool:
+        """Reject before final submission when the response form reveals a profile exclusion."""
+        with self._connect() as connection:
+            supplied_hash = hashlib.sha256(permit.encode()).hexdigest()
+            cursor = connection.execute(
+                """
+                UPDATE vacancies SET
+                    status = ?, llm_reason = ?, error_text = '',
+                    submit_attempted_at = NULL, permit_hash = NULL
+                WHERE id = ? AND status = ? AND permit_hash = ?
+                """,
+                (
+                    VacancyStatus.REJECTED_BY_FILTER.value,
+                    f"Excluded by questionnaire filter: {reason}",
+                    job_id,
+                    VacancyStatus.APPLYING.value,
+                    supplied_hash,
+                ),
+            )
+            return cursor.rowcount == 1
+
     def requeue_pre_submit_failure(self, job_id: str) -> bool:
         """Allow a new approval only when HH was never asked to submit the response."""
         with self._connect() as connection:
@@ -815,6 +838,28 @@ class Database:
                 ),
             )
             return cursor.rowcount == 1
+
+    def requeue_legacy_questionnaire_failures(self) -> int:
+        """Retry questionnaire skips recorded before automatic answers existed."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE vacancies SET
+                    status = ?, llm_decision = NULL, llm_reason = '',
+                    fit_summary = '', confidence = NULL,
+                    approval_requested_at = NULL, approval_expires_at = NULL,
+                    approved_at = NULL, applying_at = NULL, approver_id = NULL,
+                    permit_hash = NULL, error_text = '',
+                    analysis_retry_count = 0, analysis_next_retry_at = NULL
+                WHERE status = ? AND submit_attempted_at IS NULL
+                    AND error_text = 'questionnaire_required'
+                """,
+                (
+                    VacancyStatus.DISCOVERED.value,
+                    VacancyStatus.APPLY_FAILED.value,
+                ),
+            )
+            return cursor.rowcount
 
     def complete_existing_response_repair(
         self,
@@ -855,9 +900,31 @@ class Database:
                 UPDATE vacancies SET submit_attempted_at = NULL
                 WHERE id = ? AND status = ? AND applied_at IS NULL
                     AND submit_attempted_at IS NOT NULL
-                    AND error_text = 'questionnaire_required'
+                    AND error_text LIKE 'questionnaire_required%'
                 """,
                 (job_id, VacancyStatus.APPLY_FAILED.value),
+            )
+            return cursor.rowcount == 1
+
+    def resolve_verified_unsubmitted_attempt(
+        self, job_id: str, *, reason: str
+    ) -> bool:
+        """Release an uncertain slot after HH proves no negotiation exists."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE vacancies SET
+                    status = ?, submit_attempted_at = NULL,
+                    permit_hash = NULL, error_text = ?
+                WHERE id = ? AND status = ? AND applied_at IS NULL
+                    AND submit_attempted_at IS NOT NULL
+                """,
+                (
+                    VacancyStatus.EXPIRED.value,
+                    reason,
+                    job_id,
+                    VacancyStatus.APPLY_FAILED.value,
+                ),
             )
             return cursor.rowcount == 1
 

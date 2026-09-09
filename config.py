@@ -87,6 +87,7 @@ class LLMSettings:
 @dataclass(frozen=True)
 class AutoApplySettings:
     enabled: bool
+    questionnaires_enabled: bool
     min_confidence: float
     min_batch_size: int
     max_batch_size: int
@@ -498,6 +499,9 @@ def load_settings(
         approval_ttl_minutes=positive_integer("APPROVAL_TTL_MINUTES", "30"),
         auto_apply=AutoApplySettings(
             enabled=auto_apply_enabled,
+            questionnaires_enabled=boolean(
+                "AUTO_APPLY_QUESTIONNAIRES", "false"
+            ),
             min_confidence=auto_apply_min_confidence,
             min_batch_size=auto_apply_min_batch_size,
             max_batch_size=auto_apply_max_batch_size,

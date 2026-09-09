@@ -18,6 +18,12 @@ from approval import ApplicationPermission, ApprovalGuard
 from config import Settings
 from cover_letter import cover_letter_validation_error, has_required_portfolio
 from database import Database, VacancyStatus
+from questionnaire import (
+    QuestionnaireAnswer,
+    QuestionnaireOption,
+    QuestionnaireQuestion,
+    plan_questionnaire,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -25,6 +31,11 @@ logger = logging.getLogger(__name__)
 
 class QuestionnaireRequiredError(RuntimeError):
     """Employer questionnaire or test assignment required."""
+    pass
+
+
+class QuestionnairePolicyRejectedError(RuntimeError):
+    """Questionnaire reveals a condition excluded by the candidate profile."""
     pass
 
 
@@ -232,6 +243,103 @@ class HHClient:
         await self._delay()
         return True
 
+    async def _questionnaire_questions(
+        self, page: Any
+    ) -> tuple[QuestionnaireQuestion, ...]:
+        bodies = page.locator('[data-qa="task-body"]')
+        if await bodies.count() == 0:
+            return ()
+        raw_questions = await bodies.evaluate_all(
+            """blocks => blocks.map(block => {
+                const controls = Array.from(block.querySelectorAll('input, textarea, select'));
+                const radios = controls.filter(control => control.type === 'radio');
+                const text = controls.find(control => control.tagName === 'TEXTAREA' || ['text', 'number'].includes(control.type));
+                const key = radios[0]?.name || (text?.name || '').replace(/_text$/, '');
+                return {
+                    key,
+                    prompt: (block.querySelector('[data-qa="task-question"]')?.innerText || '').trim(),
+                    text_name: text?.name || '',
+                    options: radios.map((control, index) => ({
+                        value: control.value || '',
+                        label: (control.closest('label')?.innerText || control.parentElement?.innerText || '').trim(),
+                        index,
+                    })),
+                };
+            })"""
+        )
+        questions: list[QuestionnaireQuestion] = []
+        for item in raw_questions:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key", "")).strip()
+            prompt = str(item.get("prompt", "")).strip()
+            text_name = str(item.get("text_name", "")).strip()
+            if not re.fullmatch(r"task_[A-Za-z0-9_]+", key) or not prompt:
+                continue
+            options = tuple(
+                QuestionnaireOption(
+                    value=str(option.get("value", "")),
+                    label=str(option.get("label", "")).strip(),
+                    index=index,
+                )
+                for index, option in enumerate(item.get("options", []))
+                if isinstance(option, dict) and str(option.get("label", "")).strip()
+            )
+            questions.append(
+                QuestionnaireQuestion(
+                    key=key,
+                    prompt=prompt,
+                    text_name=(
+                        text_name
+                        if re.fullmatch(r"task_[A-Za-z0-9_]+", text_name)
+                        else ""
+                    ),
+                    options=options,
+                )
+            )
+        return tuple(questions)
+
+    async def _fill_questionnaire_answer(
+        self, page: Any, answer: QuestionnaireAnswer
+    ) -> None:
+        if answer.option_index is not None:
+            options = page.locator(f'input[name="{answer.option_name}"]')
+            option = options.nth(answer.option_index)
+            await option.check()
+            if hasattr(option, "is_checked") and not await option.is_checked():
+                raise RuntimeError("questionnaire_choice_not_preserved")
+        if answer.text_name:
+            textarea = page.locator(f'[name="{answer.text_name}"]').first
+            await textarea.wait_for(state="visible", timeout=5_000)
+            await textarea.fill(answer.text)
+            if await textarea.input_value() != answer.text:
+                raise RuntimeError("questionnaire_text_not_preserved")
+
+    async def _answer_questionnaire(self, page: Any) -> bool:
+        questions = await self._questionnaire_questions(page)
+        if not questions:
+            return False
+        profile = self.settings.profile
+        plan = plan_questionnaire(
+            questions,
+            profile.candidate,
+            remote_only=profile.hh.remote_only,
+            portfolio_url=profile.cover_letter.required_portfolio_url,
+            enabled=self.settings.auto_apply.questionnaires_enabled,
+        )
+        if plan.rejection_reason:
+            raise QuestionnairePolicyRejectedError(plan.rejection_reason)
+        if plan.manual_questions:
+            details = " | ".join(
+                " ".join(question.split())[:300]
+                for question in plan.manual_questions
+            )
+            raise QuestionnaireRequiredError(f"questionnaire_required:{details}")
+        for answer in plan.answers:
+            await self._fill_questionnaire_answer(page, answer)
+        logger.info("questionnaire_filled fields=%s", len(plan.answers))
+        return True
+
     async def _attach_cover_letter_after_response(
         self, page: Any, cover_letter: str, required_portfolio: str
     ) -> None:
@@ -264,8 +372,14 @@ class HHClient:
         try:
             await submit.wait_for(state="hidden", timeout=15_000)
             await attach.wait_for(state="hidden", timeout=15_000)
-        except Exception as exc:
-            raise RuntimeError("post_submit_cover_letter_not_confirmed") from exc
+        except Exception:
+            try:
+                await self._ensure_cover_letter_in_chat(
+                    page, cover_letter, required_portfolio
+                )
+                return
+            except Exception as verification_error:
+                raise RuntimeError("post_submit_cover_letter_not_confirmed") from verification_error
 
         if required_portfolio:
             await self._ensure_cover_letter_in_chat(
@@ -310,7 +424,16 @@ class HHClient:
         if required_portfolio in body:
             return
         attach = frame.get_by_text("Добавить сопроводительное", exact=False).first
-        await attach.wait_for(state="visible", timeout=5_000)
+        try:
+            await attach.wait_for(state="visible", timeout=5_000)
+        except Exception:
+            await page.reload(wait_until="domcontentloaded", timeout=30_000)
+            frame = await self._open_chat_frame(page)
+            body = await frame.locator("body").inner_text()
+            if required_portfolio in body:
+                return
+            attach = frame.get_by_text("Добавить сопроводительное", exact=False).first
+            await attach.wait_for(state="visible", timeout=10_000)
         await attach.click()
         await self.sleep(0.5)
         textarea = frame.locator('textarea[data-qa="text-input"]').first
@@ -709,7 +832,11 @@ class HHClient:
                     raise RuntimeError("configured resume was not found")
                 await option.click()
 
-            if await page.locator('textarea[name^="task_"]').count() > 0:
+            questionnaire_answered = await self._answer_questionnaire(page)
+            if (
+                not questionnaire_answered
+                and await page.locator('textarea[name^="task_"]').count() > 0
+            ):
                 raise QuestionnaireRequiredError("questionnaire_required")
 
             letter_toggle = (
@@ -723,12 +850,14 @@ class HHClient:
                 await self._delay()
 
             textarea = page.locator('textarea:not([name^="task_"])').first
+            letter_entered = False
             try:
                 await textarea.wait_for(state="visible", timeout=5_000)
                 await textarea.fill(vacancy.cover_letter)
                 await self._delay()
+                letter_entered = True
             except Exception as exc:
-                if required_portfolio:
+                if required_portfolio and not questionnaire_answered:
                     raise RuntimeError("required_cover_letter_field_unavailable") from exc
                 logger.info("cover_letter_field_not_found job_id=%s, proceeding to submit", vacancy.id)
 
@@ -737,7 +866,7 @@ class HHClient:
             ).first
             if not await submit_button.is_visible():
                 raise RuntimeError("final application button was not found")
-            if required_portfolio:
+            if required_portfolio and letter_entered:
                 entered_letter = await textarea.input_value()
                 if entered_letter != vacancy.cover_letter or not has_required_portfolio(
                     entered_letter, required_portfolio
@@ -768,6 +897,19 @@ class HHClient:
                 raise RuntimeError("application status could not be completed")
             logger.info("application_sent job_id=%s", permission.job_id)
             return True
+        except QuestionnairePolicyRejectedError as exc:
+            rejected = self.database.reject_during_application(
+                permission.job_id,
+                permission.permit,
+                reason=str(exc),
+            )
+            logger.info(
+                "application_rejected job_id=%s source=questionnaire reason=%s updated=%s",
+                permission.job_id,
+                exc,
+                rejected,
+            )
+            return False
         except QuestionnaireRequiredError as exc:
             response_still_available = False
             if page is not None:

@@ -552,6 +552,68 @@ def test_only_pre_submit_failure_can_be_requeued_for_new_approval(tmp_path: Path
     )
 
 
+def test_legacy_questionnaire_failures_are_requeued_once(tmp_path: Path) -> None:
+    database = make_database(tmp_path)
+    token = approve(database)
+    assert claim(database, "job-1", token).allowed
+    assert database.complete_application(
+        "job-1",
+        token,
+        success=False,
+        now=NOW + timedelta(minutes=3),
+        error_text="questionnaire_required",
+    )
+
+    assert database.requeue_legacy_questionnaire_failures() == 1
+    requeued = database.get("job-1")
+    assert requeued.status is VacancyStatus.DISCOVERED
+    assert requeued.llm_decision is None
+    assert database.requeue_legacy_questionnaire_failures() == 0
+
+
+def test_questionnaire_policy_rejection_releases_reserved_slot(tmp_path: Path) -> None:
+    database = make_database(tmp_path)
+    token = approve(database)
+    assert claim(database, "job-1", token, daily_limit=1).allowed
+    assert database.mark_submit_attempt(
+        "job-1", token, now=NOW + timedelta(minutes=3), daily_limit=1
+    )
+
+    assert database.reject_during_application(
+        "job-1", token, reason="questionnaire_company:blocked"
+    )
+
+    vacancy = database.get("job-1")
+    assert vacancy.status is VacancyStatus.REJECTED_BY_FILTER
+    assert vacancy.submit_attempted_at is None
+    assert database.available_application_slots(
+        daily_limit=1, now=NOW + timedelta(minutes=4)
+    ) == 1
+
+
+def test_verified_missing_negotiation_releases_uncertain_slot(tmp_path: Path) -> None:
+    database = make_database(tmp_path)
+    token = approve(database)
+    assert claim(database, "job-1", token, daily_limit=1).allowed
+    assert database.mark_submit_attempt(
+        "job-1", token, now=NOW + timedelta(minutes=3), daily_limit=1
+    )
+    assert database.complete_application(
+        "job-1", token, success=False, now=NOW + timedelta(minutes=4)
+    )
+
+    assert database.resolve_verified_unsubmitted_attempt(
+        "job-1", reason="vacancy_archived_without_negotiation"
+    )
+
+    vacancy = database.get("job-1")
+    assert vacancy.status is VacancyStatus.EXPIRED
+    assert vacancy.submit_attempted_at is None
+    assert database.available_application_slots(
+        daily_limit=1, now=NOW + timedelta(minutes=5)
+    ) == 1
+
+
 def test_submit_attempt_failure_cannot_be_requeued(tmp_path: Path) -> None:
     database = make_database(tmp_path)
     token = approve(database)

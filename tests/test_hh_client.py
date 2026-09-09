@@ -261,6 +261,58 @@ class ChatCoverLetterPage:
         return ChatCoverLetterLocator(self.frame, "chat")
 
 
+class EventuallyConsistentChatLocator:
+    def __init__(self, page: "EventuallyConsistentChatPage", kind: str):
+        self.page = page
+        self.kind = kind
+        self.first = self
+
+    async def click(self) -> None:
+        return None
+
+    async def wait_for(self, **kwargs) -> None:
+        if self.kind == "attach":
+            raise RuntimeError("attach action not available while message is propagating")
+
+    async def inner_text(self) -> str:
+        if self.kind == "body" and self.page.reloads:
+            return self.page.portfolio
+        return "Отклик отправлен"
+
+
+class EventuallyConsistentChatFrame:
+    url = "https://chatik.hh.ru/chat/eventual"
+
+    def __init__(self, page: "EventuallyConsistentChatPage"):
+        self.page = page
+
+    def locator(self, selector: str) -> EventuallyConsistentChatLocator:
+        assert selector == "body"
+        return EventuallyConsistentChatLocator(self.page, "body")
+
+    def get_by_text(
+        self, text: str, *, exact: bool
+    ) -> EventuallyConsistentChatLocator:
+        assert text == "Добавить сопроводительное"
+        assert not exact
+        return EventuallyConsistentChatLocator(self.page, "attach")
+
+
+class EventuallyConsistentChatPage:
+    def __init__(self, portfolio: str):
+        self.portfolio = portfolio
+        self.reloads = 0
+        self.frame = EventuallyConsistentChatFrame(self)
+        self.frames = [self.frame]
+
+    def locator(self, selector: str) -> EventuallyConsistentChatLocator:
+        assert selector == 'button[data-qa="vacancy-response-link-view-topic"]'
+        return EventuallyConsistentChatLocator(self, "chat")
+
+    async def reload(self, **kwargs) -> None:
+        self.reloads += 1
+
+
 class RetryLoginPage(FakePage):
     def __init__(self):
         super().__init__()
@@ -745,6 +797,37 @@ def test_missing_cover_letter_is_attached_and_verified_inside_chat_frame(
 
     assert page.frame.sent
     assert page.frame.value == letter
+
+
+def test_eventually_visible_cover_letter_is_confirmed_after_chat_reload(
+    tmp_path: Path,
+) -> None:
+    settings = replace(
+        load_settings(profile_path=write_profile(tmp_path), environ=VALID_ENV),
+        database_path=tmp_path / "agent.db",
+        min_seconds_between_actions=0,
+    )
+    database = Database(settings.database_path)
+    database.init()
+    portfolio = "https://portfolio.example/candidate"
+    page = EventuallyConsistentChatPage(portfolio)
+    client = HHClient(
+        FakeContext(page),
+        settings,
+        database,
+        ApprovalGuard(settings, database),
+        sleep=lambda _: asyncio.sleep(0),
+    )
+
+    asyncio.run(
+        client._ensure_cover_letter_in_chat(
+            page,
+            f"Relevant experience.\n\nПортфолио: {portfolio}",
+            portfolio,
+        )
+    )
+
+    assert page.reloads == 1
 
 
 @pytest.mark.parametrize(
