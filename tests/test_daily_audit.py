@@ -115,6 +115,55 @@ def test_report_can_skip_platform_service_check(tmp_path: Path) -> None:
     assert "основной сервис не работает" not in text
 
 
+def test_pre_submit_page_failure_is_not_reported_as_uncertain_delivery(
+    tmp_path: Path,
+) -> None:
+    profile = write_profile(tmp_path)
+    settings = load_settings(
+        environ={
+            **VALID_ENV,
+            "DATABASE_PATH": str(tmp_path / "agent.db"),
+            "AUTO_APPLY_TIMEZONE": "Europe/Berlin",
+        },
+        profile_path=profile,
+    )
+    Database(settings.database_path).init()
+    with sqlite3.connect(settings.database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO vacancies (
+                id, title, company, url, status, discovered_at, error_text
+            ) VALUES (?, ?, ?, ?, 'apply_failed', ?, 'page_structure_changed')
+            """,
+            (
+                "job-pre-submit",
+                "Product Designer",
+                "Example",
+                "https://example.com/job-pre-submit",
+                "2026-07-27T10:00:00+00:00",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO search_runs (
+                started_at, finished_at, state, query_count, found_results,
+                new_vacancies, duplicates, rejected_by_filter, rejected_by_llm,
+                telegram_cards, error_count, rejection_reasons_json,
+                error_reasons_json, last_safe_error, circuit_reason
+            ) VALUES (?, ?, 'completed', 1, 1, 1, 0, 0, 0, 0, 1, '{}', '{}', '', '')
+            """,
+            ("2026-07-27T10:00:00+00:00", "2026-07-27T11:00:00+00:00"),
+        )
+
+    text, _, _ = build_report(
+        settings,
+        now=datetime(2026, 7, 27, 21, 0, tzinfo=UTC),
+        state=ServiceState(True, True, 123),
+    )
+
+    assert "неопределённых отправок" not in text
+
+
 def test_day_bounds_respect_daylight_saving_transition() -> None:
     start, end = _day_bounds(date(2026, 3, 29), ZoneInfo("Europe/Berlin"))
 

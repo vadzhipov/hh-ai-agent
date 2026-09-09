@@ -112,8 +112,9 @@ def build_report(
             """
             SELECT COUNT(*) FROM vacancies
             WHERE status = 'apply_failed'
-              AND COALESCE(submit_attempted_at, applying_at, discovered_at) >= ?
-              AND COALESCE(submit_attempted_at, applying_at, discovered_at) < ?
+              AND submit_attempted_at IS NOT NULL
+              AND submit_attempted_at >= ?
+              AND submit_attempted_at < ?
               AND error_text NOT LIKE 'questionnaire_required%'
             """,
             (start, end),
