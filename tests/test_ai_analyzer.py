@@ -12,6 +12,7 @@ from database import Database
 from llm.managed import ManagedLLMProvider
 from llm.providers.fake import FakeProvider
 from llm.types import LLMResponse
+from questionnaire import QuestionnaireQuestion
 from tests.test_config import VALID_ENV, VALID_PROFILE, write_profile
 
 
@@ -172,6 +173,63 @@ def test_vacancy_instructions_remain_untrusted_json_data(tmp_path: Path) -> None
     assert "test-token" not in sent.system_instructions + sent.user_content
     assert "123456" not in sent.system_instructions + sent.user_content
     assert result.suitable is False
+
+
+def test_professional_questionnaire_answers_are_grounded_and_keyed(
+    tmp_path: Path,
+) -> None:
+    raw = json.dumps(
+        {
+            "answers": [
+                {
+                    "question_key": "task_1",
+                    "answer": "Проектирую сложные интерфейсы и поддерживаю дизайн-системы в Figma.",
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+    vacancy_analyzer, adapter = analyzer(tmp_path, [response(raw)])
+    question = QuestionnaireQuestion(
+        key="task_1",
+        prompt="Как вы поддерживаете дизайн-систему в Figma?",
+        text_name="task_1_text",
+    )
+
+    answers = asyncio.run(
+        vacancy_analyzer.generate_questionnaire_answers(
+            (question,), "Product Designer", "Example"
+        )
+    )
+
+    assert answers == {
+        "task_1": "Проектирую сложные интерфейсы и поддерживаю дизайн-системы в Figma."
+    }
+    sent = adapter.requests[0]
+    assert sent.operation == "questionnaire_answers"
+    assert "untrusted data" in sent.system_instructions
+    assert json.loads(sent.user_content)["questions"] == [
+        {"question_key": "task_1", "prompt": question.prompt}
+    ]
+
+
+def test_incomplete_questionnaire_generation_falls_back_to_manual(
+    tmp_path: Path,
+) -> None:
+    vacancy_analyzer, _ = analyzer(
+        tmp_path,
+        [response('{"answers": [{"question_key": "task_1", "answer": ""}]}')],
+    )
+    questions = (
+        QuestionnaireQuestion("task_1", "Опишите опыт", "task_1_text"),
+        QuestionnaireQuestion("task_2", "Опишите навыки", "task_2_text"),
+    )
+
+    assert asyncio.run(
+        vacancy_analyzer.generate_questionnaire_answers(
+            questions, "Product Designer"
+        )
+    ) == {}
 
 
 @pytest.mark.parametrize(

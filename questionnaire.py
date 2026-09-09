@@ -32,6 +32,7 @@ class QuestionnaireAnswer:
 @dataclass(frozen=True)
 class QuestionnairePlan:
     answers: tuple[QuestionnaireAnswer, ...] = ()
+    generated_questions: tuple[QuestionnaireQuestion, ...] = ()
     manual_questions: tuple[str, ...] = ()
     rejection_reason: str = ""
 
@@ -43,6 +44,53 @@ _OFFICE_TERMS = ("офис", "гибрид", "очно", "on-site", "onsite")
 _PORTFOLIO_TERMS = ("портфолио", "portfolio")
 _YES_LABELS = ("да", "yes", "готов", "подходит")
 _NO_LABELS = ("нет", "no", "не готов", "не подходит")
+_PROFESSIONAL_TERMS = (
+    "опыт",
+    "дизайн",
+    "figma",
+    "интерфейс",
+    "продукт",
+    "проектир",
+    "исследован",
+    "прототип",
+    "сценари",
+    "пользовател",
+    "разработ",
+    "аналитик",
+    "метрик",
+    "ux",
+    "ui",
+    "saas",
+    "crm",
+    "финтех",
+    "нейросет",
+)
+_SENSITIVE_TERMS = (
+    "граждан",
+    "разрешение на работу",
+    "виз",
+    "паспорт",
+    "возраст",
+    "семейн",
+    "детей",
+    "здоров",
+    "инвалид",
+    "судим",
+    "военн",
+    "национальн",
+    "религи",
+    "политичес",
+    "телефон",
+    "почт",
+    "email",
+    "e-mail",
+    "адрес",
+    "переезд",
+    "релокац",
+    "дата выхода",
+    "когда готовы",
+    "отработка",
+)
 
 
 def _match_term(text: str, terms: tuple[str, ...]) -> str | None:
@@ -125,6 +173,16 @@ def _remote_answer(
     )
 
 
+def _is_professional_text_question(question: QuestionnaireQuestion) -> bool:
+    normalized = question.prompt.casefold()
+    return bool(
+        question.text_name
+        and not question.options
+        and not any(term in normalized for term in _SENSITIVE_TERMS)
+        and any(term in normalized for term in _PROFESSIONAL_TERMS)
+    )
+
+
 def plan_questionnaire(
     questions: tuple[QuestionnaireQuestion, ...],
     candidate: CandidateProfile,
@@ -141,6 +199,7 @@ def plan_questionnaire(
         )
 
     answers: list[QuestionnaireAnswer] = []
+    generated: list[QuestionnaireQuestion] = []
     manual: list[str] = []
     for question in questions:
         normalized = question.prompt.casefold()
@@ -156,11 +215,20 @@ def plan_questionnaire(
                     text_name=question.text_name,
                     text=portfolio_url,
                 )
+        elif _is_professional_text_question(question):
+            generated.append(question)
+            continue
         if answer is None:
             manual.append(question.prompt)
         else:
             answers.append(answer)
 
     if manual:
-        return QuestionnairePlan(manual_questions=tuple(manual))
-    return QuestionnairePlan(answers=tuple(answers))
+        return QuestionnairePlan(
+            manual_questions=tuple(
+                [*manual, *(question.prompt for question in generated)]
+            )
+        )
+    return QuestionnairePlan(
+        answers=tuple(answers), generated_questions=tuple(generated)
+    )

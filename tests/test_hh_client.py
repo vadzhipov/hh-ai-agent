@@ -205,6 +205,11 @@ class ChatCoverLetterLocator:
     async def wait_for(self, **kwargs) -> None:
         return None
 
+    async def is_visible(self) -> bool:
+        if self.kind == "attach":
+            return not self.frame.sent
+        return True
+
     async def click(self) -> None:
         if self.kind == "attach":
             self.frame.form_open = True
@@ -273,6 +278,9 @@ class EventuallyConsistentChatLocator:
     async def wait_for(self, **kwargs) -> None:
         if self.kind == "attach":
             raise RuntimeError("attach action not available while message is propagating")
+
+    async def is_visible(self) -> bool:
+        return False
 
     async def inner_text(self) -> str:
         if self.kind == "body" and self.page.reloads:

@@ -126,3 +126,43 @@ def test_questionnaire_auto_answers_are_opt_in(tmp_path) -> None:
 
     assert plan.answers == ()
     assert plan.manual_questions == (question.prompt,)
+
+
+def test_professional_text_questions_are_marked_for_grounded_generation(
+    tmp_path,
+) -> None:
+    question = QuestionnaireQuestion(
+        key="task_4",
+        prompt="Как вы выстраиваете и поддерживаете дизайн-систему в Figma?",
+        text_name="task_4_text",
+    )
+
+    plan = plan_questionnaire(
+        (question,),
+        candidate(tmp_path),
+        remote_only=True,
+        portfolio_url="",
+        enabled=True,
+    )
+
+    assert plan.manual_questions == ()
+    assert plan.generated_questions == (question,)
+
+
+def test_sensitive_text_question_is_never_sent_for_generation(tmp_path) -> None:
+    question = QuestionnaireQuestion(
+        key="task_5",
+        prompt="Укажите гражданство и есть ли разрешение на работу.",
+        text_name="task_5_text",
+    )
+
+    plan = plan_questionnaire(
+        (question,),
+        candidate(tmp_path),
+        remote_only=True,
+        portfolio_url="",
+        enabled=True,
+    )
+
+    assert plan.generated_questions == ()
+    assert plan.manual_questions == (question.prompt,)

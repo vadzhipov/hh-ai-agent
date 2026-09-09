@@ -754,7 +754,11 @@ async def run(settings: Settings) -> None:
     try:
         context = await backend.start()
         guard = ApprovalGuard(settings, database)
+        analyzer = VacancyAnalyzer(settings, llm_provider)
         hh_client = HHClient(context, settings, database, guard)
+        hh_client.questionnaire_answerer = getattr(
+            analyzer, "generate_questionnaire_answers", None
+        )
         if not await hh_client.ensure_login():
             raise RuntimeError(
                 "HH.ru login is required. Run with BROWSER_HEADLESS=false and sign in manually."
@@ -764,7 +768,6 @@ async def run(settings: Settings) -> None:
         telegram = TelegramService(
             settings, database, approval_service, control, mistral_keys=mistral_keys
         )
-        analyzer = VacancyAnalyzer(settings, llm_provider)
         if mistral_keys is not None:
             mistral_keys.set_notifier(telegram.notify)
         if hasattr(telegram, "check_updates"):

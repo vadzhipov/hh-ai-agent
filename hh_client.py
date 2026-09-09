@@ -82,6 +82,9 @@ class CompanyDetails:
 
 
 CaptchaSolver = Callable[[Path, str, int], Awaitable[str | None]]
+QuestionnaireAnswerer = Callable[
+    [tuple[QuestionnaireQuestion, ...], str, str], Awaitable[dict[str, str]]
+]
 
 
 def _vacancy_id(url: str) -> str | None:
@@ -133,6 +136,7 @@ class HHClient:
         database: Database,
         approval_guard: ApprovalGuard,
         *,
+        questionnaire_answerer: QuestionnaireAnswerer | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         now_factory: Callable[[], datetime] | None = None,
     ):
@@ -140,6 +144,7 @@ class HHClient:
         self.settings = settings
         self.database = database
         self.approval_guard = approval_guard
+        self.questionnaire_answerer = questionnaire_answerer
         self.sleep = sleep
         self.now_factory = now_factory or (lambda: datetime.now(UTC))
 
@@ -315,7 +320,9 @@ class HHClient:
             if await textarea.input_value() != answer.text:
                 raise RuntimeError("questionnaire_text_not_preserved")
 
-    async def _answer_questionnaire(self, page: Any) -> bool:
+    async def _answer_questionnaire(
+        self, page: Any, vacancy_title: str, company_name: str
+    ) -> bool:
         questions = await self._questionnaire_questions(page)
         if not questions:
             return False
@@ -329,15 +336,40 @@ class HHClient:
         )
         if plan.rejection_reason:
             raise QuestionnairePolicyRejectedError(plan.rejection_reason)
-        if plan.manual_questions:
+        answers = list(plan.answers)
+        manual_questions = list(plan.manual_questions)
+        if plan.generated_questions:
+            generated: dict[str, str] = {}
+            if self.questionnaire_answerer is not None:
+                try:
+                    generated = await self.questionnaire_answerer(
+                        plan.generated_questions, vacancy_title, company_name
+                    )
+                except Exception as exc:
+                    logger.warning("questionnaire_generation_failed error=%s", exc)
+            expected = {question.key for question in plan.generated_questions}
+            if set(generated) == expected and all(generated.values()):
+                answers.extend(
+                    QuestionnaireAnswer(
+                        key=question.key,
+                        text_name=question.text_name,
+                        text=generated[question.key],
+                    )
+                    for question in plan.generated_questions
+                )
+            else:
+                manual_questions.extend(
+                    question.prompt for question in plan.generated_questions
+                )
+        if manual_questions:
             details = " | ".join(
                 " ".join(question.split())[:300]
-                for question in plan.manual_questions
+                for question in manual_questions
             )
             raise QuestionnaireRequiredError(f"questionnaire_required:{details}")
-        for answer in plan.answers:
+        for answer in answers:
             await self._fill_questionnaire_answer(page, answer)
-        logger.info("questionnaire_filled fields=%s", len(plan.answers))
+        logger.info("questionnaire_filled fields=%s", len(answers))
         return True
 
     async def _attach_cover_letter_after_response(
@@ -374,6 +406,7 @@ class HHClient:
             await attach.wait_for(state="hidden", timeout=15_000)
         except Exception:
             try:
+                await page.reload(wait_until="domcontentloaded", timeout=30_000)
                 await self._ensure_cover_letter_in_chat(
                     page, cover_letter, required_portfolio
                 )
@@ -420,20 +453,21 @@ class HHClient:
 
             page.on("response", capture_response)
         frame = await self._open_chat_frame(page)
-        body = await frame.locator("body").inner_text()
-        if required_portfolio in body:
+        state, attach = await self._wait_for_cover_letter_chat_state(
+            frame, required_portfolio
+        )
+        if state == "present":
             return
-        attach = frame.get_by_text("Добавить сопроводительное", exact=False).first
-        try:
-            await attach.wait_for(state="visible", timeout=5_000)
-        except Exception:
+        if state != "attach_available":
             await page.reload(wait_until="domcontentloaded", timeout=30_000)
             frame = await self._open_chat_frame(page)
-            body = await frame.locator("body").inner_text()
-            if required_portfolio in body:
+            state, attach = await self._wait_for_cover_letter_chat_state(
+                frame, required_portfolio
+            )
+            if state == "present":
                 return
-            attach = frame.get_by_text("Добавить сопроводительное", exact=False).first
-            await attach.wait_for(state="visible", timeout=10_000)
+        if state != "attach_available":
+            raise RuntimeError("chat_cover_letter_state_unconfirmed")
         await attach.click()
         await self.sleep(0.5)
         textarea = frame.locator('textarea[data-qa="text-input"]').first
@@ -468,6 +502,23 @@ class HHClient:
                 "chat_cover_letter_not_confirmed:"
                 f"post_statuses={post_statuses}:remaining_chars={remaining}"
             ) from exc
+
+    async def _wait_for_cover_letter_chat_state(
+        self, frame: Any, required_portfolio: str
+    ) -> tuple[str, Any]:
+        attach = None
+        for _ in range(30):
+            body = await frame.locator("body").inner_text()
+            if required_portfolio in body:
+                return "present", attach
+            if attach is None:
+                attach = frame.get_by_text(
+                    "Добавить сопроводительное", exact=False
+                ).first
+            if await attach.is_visible():
+                return "attach_available", attach
+            await self.sleep(0.5)
+        return "pending", attach
 
     async def attach_existing_cover_letter(
         self, job_id: str, *, cover_letter: str | None = None
@@ -832,7 +883,9 @@ class HHClient:
                     raise RuntimeError("configured resume was not found")
                 await option.click()
 
-            questionnaire_answered = await self._answer_questionnaire(page)
+            questionnaire_answered = await self._answer_questionnaire(
+                page, vacancy.title, vacancy.company
+            )
             if (
                 not questionnaire_answered
                 and await page.locator('textarea[name^="task_"]').count() > 0
