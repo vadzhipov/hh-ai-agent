@@ -29,6 +29,7 @@ from main import (
     SearchRunStats,
     agent_loop,
     format_auto_batch_report,
+    next_auto_batch_after_run,
     next_auto_batch_at,
     next_auto_window_start_after,
     process_vacancy,
@@ -439,7 +440,7 @@ def test_auto_batch_schedule_stays_inside_configured_daytime_window(
     assert after_limit.astimezone(local_timezone).hour == 10
 
 
-def test_auto_schedule_restart_preserves_minimum_interval(tmp_path: Path) -> None:
+def test_auto_schedule_restart_underfilled_batch_on_restart(tmp_path: Path) -> None:
     app_settings = auto_settings(tmp_path)
     database = Database(app_settings.database_path)
     database.init()
@@ -465,7 +466,7 @@ def test_auto_schedule_restart_preserves_minimum_interval(tmp_path: Path) -> Non
         restart_at, app_settings, database, interval_hours=3
     )
 
-    assert next_batch == last_batch_finished + timedelta(hours=3)
+    assert next_batch == next_auto_batch_at(restart_at, app_settings)
 
 
 def test_auto_batch_report_contains_result_and_next_run(tmp_path: Path) -> None:
@@ -528,6 +529,28 @@ def test_auto_batch_keeps_uncertain_delivery_paused(tmp_path: Path) -> None:
     assert retry_at is None
     assert control.paused is True
     assert control.circuit_reason == "application_delivery_uncertain"
+
+
+def test_underfilled_auto_batch_retries_after_check_interval(tmp_path: Path) -> None:
+    app_settings = auto_settings(tmp_path)
+
+    retry_at = next_auto_batch_after_run(
+        NOW,
+        app_settings,
+        sent=2,
+        target=10,
+        interval_hours=5,
+    )
+    full_batch_at = next_auto_batch_after_run(
+        NOW,
+        app_settings,
+        sent=10,
+        target=10,
+        interval_hours=5,
+    )
+
+    assert retry_at == NOW + timedelta(minutes=app_settings.check_interval_minutes)
+    assert full_batch_at == NOW + timedelta(hours=5)
 
 
 def test_browser_read_error_is_persisted_as_apply_failed(tmp_path: Path) -> None:

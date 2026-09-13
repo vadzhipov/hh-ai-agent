@@ -144,7 +144,7 @@ def restored_auto_batch_at(
     *,
     interval_hours: int,
 ) -> datetime:
-    """Keep a restarted auto-apply process from starting a second batch early."""
+    """Resume an underfilled batch now; otherwise preserve the normal interval."""
     previous = database.latest_search_run()
     if previous is None:
         return next_auto_batch_at(now, settings)
@@ -152,6 +152,8 @@ def restored_auto_batch_at(
         finished_at = datetime.fromisoformat(previous.finished_at)
     except ValueError:
         logger.warning("auto_schedule_restore_failed run_id=%s", previous.id)
+        return next_auto_batch_at(now, settings)
+    if database.applied_today(now) < settings.auto_apply.min_batch_size:
         return next_auto_batch_at(now, settings)
     return next_auto_batch_at(
         finished_at, settings, interval_hours=interval_hours
@@ -175,6 +177,22 @@ def recoverable_auto_retry_at(
     return next_auto_batch_at(
         after + timedelta(minutes=settings.check_interval_minutes), settings
     )
+
+
+def next_auto_batch_after_run(
+    after: datetime,
+    settings: Settings,
+    *,
+    sent: int,
+    target: int,
+    interval_hours: int,
+) -> datetime:
+    """Retry an underfilled batch sooner without leaving active hours."""
+    if sent < target:
+        return next_auto_batch_at(
+            after + timedelta(minutes=settings.check_interval_minutes), settings
+        )
+    return next_auto_batch_at(after, settings, interval_hours=interval_hours)
 
 
 def format_auto_batch_report(
@@ -706,6 +724,10 @@ async def agent_loop(
                         auto_apply_batch_limit=batch_size,
                         now_factory=clock,
                     )
+                    applied_in_batch = max(
+                        0,
+                        database.applied_today(clock()) - applications_before,
+                    )
                     retry_at = recoverable_auto_retry_at(
                         control, clock(), settings
                     )
@@ -715,9 +737,11 @@ async def agent_loop(
                     elif control.paused:
                         control.next_run_at = None
                     else:
-                        next_auto_batch = next_auto_batch_at(
+                        next_auto_batch = next_auto_batch_after_run(
                             clock(),
                             settings,
+                            sent=applied_in_batch,
+                            target=batch_size,
                             interval_hours=randint(
                                 settings.auto_apply.min_interval_hours,
                                 settings.auto_apply.max_interval_hours,
@@ -728,11 +752,7 @@ async def agent_loop(
                         await telegram.notify(
                             format_auto_batch_report(
                                 run,
-                                auto_applied=max(
-                                    0,
-                                    database.applied_today(clock())
-                                    - applications_before,
-                                ),
+                                auto_applied=applied_in_batch,
                                 next_batch=control.next_run_at,
                                 settings=settings,
                             )
