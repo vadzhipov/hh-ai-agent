@@ -73,6 +73,37 @@ def _audit_day(now: datetime, settings: Settings) -> date:
     return local.date()
 
 
+def recoverable_runtime_stall(settings: Settings, *, now: datetime) -> bool:
+    """Detect a live process that made no daily run or kept a network pause."""
+    start, end = _day_bounds(
+        _audit_day(now, settings), ZoneInfo(settings.auto_apply.timezone)
+    )
+    try:
+        connection = sqlite3.connect(
+            f"file:{settings.database_path}?mode=ro", uri=True
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            latest = connection.execute(
+                """
+                SELECT state, circuit_reason FROM search_runs
+                WHERE started_at >= ? AND started_at < ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (start, end),
+            ).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return False
+    if latest is None:
+        return True
+    return (
+        latest["state"] == "paused_by_circuit_breaker"
+        and latest["circuit_reason"] == "search_errors"
+    )
+
+
 def build_report(
     settings: Settings,
     *,
@@ -245,15 +276,22 @@ def cli(argv: list[str] | None = None) -> int:
     if args.launchd_label and sys.platform != "darwin":
         parser.error("--launchd-label is supported only on macOS")
     settings = load_settings(args.env_file)
+    now = datetime.now(UTC)
     state = service_state(args.launchd_label) if args.launchd_label else None
     restarted = False
-    if args.repair_service and state is not None and not state.running and state.loaded:
+    stalled = recoverable_runtime_stall(settings, now=now)
+    if (
+        args.repair_service
+        and state is not None
+        and state.loaded
+        and (not state.running or stalled)
+    ):
         restarted = repair_service(args.launchd_label)
         if restarted:
             __import__("time").sleep(2)
             state = service_state(args.launchd_label)
     text, healthy, day = build_report(
-        settings, now=datetime.now(UTC), state=state, restarted=restarted
+        settings, now=now, state=state, restarted=restarted
     )
     print(text)
     if args.send:

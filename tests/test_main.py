@@ -32,6 +32,7 @@ from main import (
     next_auto_batch_at,
     next_auto_window_start_after,
     process_vacancy,
+    recoverable_auto_retry_at,
     restored_auto_batch_at,
     run_search_cycle,
 )
@@ -499,6 +500,34 @@ def test_auto_batch_report_contains_result_and_next_run(tmp_path: Path) -> None:
     assert "Отправлено: 4; на ручную проверку: 2." in report
     assert "Отсечено фильтрами: 8; пропущено без отправки: 1." in report
     assert "Следующая пачка: 26.07 10:10 Europe/Berlin." in report
+
+
+def test_auto_batch_recovers_only_transient_search_pause(tmp_path: Path) -> None:
+    app_settings = auto_settings(tmp_path)
+    control = AgentControl()
+    control.paused = True
+    control.circuit_reason = "search_errors"
+    control.consecutive_search_errors = 3
+
+    retry_at = recoverable_auto_retry_at(control, NOW, app_settings)
+
+    assert retry_at == NOW + timedelta(minutes=app_settings.check_interval_minutes)
+    assert control.paused is False
+    assert control.circuit_reason == ""
+    assert control.consecutive_search_errors == 0
+
+
+def test_auto_batch_keeps_uncertain_delivery_paused(tmp_path: Path) -> None:
+    app_settings = auto_settings(tmp_path)
+    control = AgentControl()
+    control.paused = True
+    control.circuit_reason = "application_delivery_uncertain"
+
+    retry_at = recoverable_auto_retry_at(control, NOW, app_settings)
+
+    assert retry_at is None
+    assert control.paused is True
+    assert control.circuit_reason == "application_delivery_uncertain"
 
 
 def test_browser_read_error_is_persisted_as_apply_failed(tmp_path: Path) -> None:

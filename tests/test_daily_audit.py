@@ -6,7 +6,12 @@ from zoneinfo import ZoneInfo
 
 import daily_audit
 from config import load_settings
-from daily_audit import ServiceState, _day_bounds, build_report
+from daily_audit import (
+    ServiceState,
+    _day_bounds,
+    build_report,
+    recoverable_runtime_stall,
+)
 from database import Database
 from tests.test_config import VALID_ENV, VALID_PROFILE, write_profile
 
@@ -170,6 +175,48 @@ def test_day_bounds_respect_daylight_saving_transition() -> None:
     duration = datetime.fromisoformat(end) - datetime.fromisoformat(start)
 
     assert duration.total_seconds() == 23 * 60 * 60
+
+
+def test_runtime_stall_detects_network_pause_but_not_delivery_uncertainty(
+    tmp_path: Path,
+) -> None:
+    profile = write_profile(tmp_path)
+    settings = load_settings(
+        environ={
+            **VALID_ENV,
+            "DATABASE_PATH": str(tmp_path / "agent.db"),
+            "AUTO_APPLY_TIMEZONE": "Europe/Berlin",
+        },
+        profile_path=profile,
+    )
+    Database(settings.database_path).init()
+    with sqlite3.connect(settings.database_path) as connection:
+        values = (
+            "2026-07-27T10:00:00+00:00",
+            "2026-07-27T11:00:00+00:00",
+        )
+        connection.execute(
+            """
+            INSERT INTO search_runs (
+                started_at, finished_at, state, query_count, found_results,
+                new_vacancies, duplicates, rejected_by_filter, rejected_by_llm,
+                telegram_cards, error_count, rejection_reasons_json,
+                error_reasons_json, last_safe_error, circuit_reason
+            ) VALUES (?, ?, 'paused_by_circuit_breaker', 1, 0, 0, 0, 0, 0,
+                      0, 1, '{}', '{}', '', 'search_errors')
+            """,
+            values,
+        )
+
+    now = datetime(2026, 7, 27, 21, 0, tzinfo=UTC)
+    assert recoverable_runtime_stall(settings, now=now) is True
+
+    with sqlite3.connect(settings.database_path) as connection:
+        connection.execute(
+            "UPDATE search_runs SET circuit_reason = 'application_delivery_uncertain'"
+        )
+
+    assert recoverable_runtime_stall(settings, now=now) is False
 
 
 def test_cli_rechecks_same_launchd_service_after_repair(

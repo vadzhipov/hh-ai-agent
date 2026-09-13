@@ -36,6 +36,7 @@ from version import __version__
 
 logger = logging.getLogger(__name__)
 ANALYSIS_MAX_ATTEMPTS = 3
+RECOVERABLE_AUTO_CIRCUIT_REASONS = frozenset({"search_errors"})
 
 
 @dataclass(frozen=True)
@@ -154,6 +155,25 @@ def restored_auto_batch_at(
         return next_auto_batch_at(now, settings)
     return next_auto_batch_at(
         finished_at, settings, interval_hours=interval_hours
+    )
+
+
+def recoverable_auto_retry_at(
+    control: AgentControl,
+    after: datetime,
+    settings: Settings,
+) -> datetime | None:
+    """Clear a transient search pause and keep the retry inside active hours."""
+    if (
+        not control.paused
+        or control.circuit_reason not in RECOVERABLE_AUTO_CIRCUIT_REASONS
+    ):
+        return None
+    control.paused = False
+    control.circuit_reason = ""
+    control.consecutive_search_errors = 0
+    return next_auto_batch_at(
+        after + timedelta(minutes=settings.check_interval_minutes), settings
     )
 
 
@@ -535,10 +555,16 @@ async def run_search_cycle(
         failure = exc
 
     if circuit_reason:
-        notification = (
-            f"Поиск приостановлен: {circuit_reason}. "
-            "Проверьте /diagnostics и выполните /resume после устранения причины."
-        )
+        if circuit_reason in RECOVERABLE_AUTO_CIRCUIT_REASONS:
+            notification = (
+                "Текущий поиск остановлен из-за сетевых ошибок. "
+                "В режиме автоподачи повтор будет назначен автоматически."
+            )
+        else:
+            notification = (
+                f"Поиск приостановлен: {circuit_reason}. "
+                "Проверьте /diagnostics и выполните /resume после устранения причины."
+            )
     elif (
         auto_apply_batch_limit is None
         and state == "completed"
@@ -680,7 +706,13 @@ async def agent_loop(
                         auto_apply_batch_limit=batch_size,
                         now_factory=clock,
                     )
-                    if control.paused:
+                    retry_at = recoverable_auto_retry_at(
+                        control, clock(), settings
+                    )
+                    if retry_at is not None:
+                        next_auto_batch = retry_at
+                        control.next_run_at = next_auto_batch
+                    elif control.paused:
                         control.next_run_at = None
                     else:
                         next_auto_batch = next_auto_batch_at(
